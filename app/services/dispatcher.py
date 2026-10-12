@@ -69,7 +69,8 @@ async def is_eligible(session: AsyncSession, account_id: int) -> bool:
 
 class _Pass(NamedTuple):
     message_id: int | None
-    busy: bool  # dispatchable work was skipped because another transaction held its locks
+    busy: bool = False  # dispatchable work was skipped: another transaction held its locks
+    held: bool = False  # messages were newly held for an unavailable pinned operator
 
 
 async def dispatch_one(session: AsyncSession, *, candidate_limit: int | None = None) -> int | None:
@@ -98,6 +99,8 @@ async def dispatch_batch(
         if result.message_id is not None:
             assigned.append(result.message_id)
             busy_streak = 0
+        elif result.held:
+            continue  # held messages leave the candidate window; newer ones may be dispatchable
         elif result.busy and busy_streak < max_busy_retries:
             busy_streak += 1
             await asyncio.sleep(0.002 * busy_streak)
@@ -132,7 +135,7 @@ def _candidates(limit: int) -> Select[int, int]:
 async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> _Pass:
     limit = candidate_limit or get_settings().DISPATCH_CANDIDATE_LIMIT
     candidates = (await session.execute(_candidates(limit))).all()
-    busy = False
+    busy = held = False
     skipped: set[int] = set()
     for message_id, conversation_id in candidates:
         if conversation_id in skipped:
@@ -161,10 +164,10 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
                 busy = True
             elif locked:
                 await _assign(session, message_id, conversation_id, pinned, AssignmentReason.PINNED)
-                return _Pass(message_id, busy)
+                return _Pass(message_id)
             else:
                 # Owner's rule: no automatic reassignment; a human moves the conversation.
-                await _hold_for_pinned_operator(session, conversation_id, pinned)
+                held |= await _hold_for_pinned_operator(session, conversation_id, pinned)
             skipped.add(conversation_id)
             continue
 
@@ -173,12 +176,12 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
             await _assign(
                 session, message_id, conversation_id, account_id, AssignmentReason.AUTO_ROUND_ROBIN
             )
-            return _Pass(message_id, busy)
+            return _Pass(message_id)
         if not operators_busy:
-            return _Pass(None, False)  # no eligible operator at all; messages stay pending
+            return _Pass(None, held=held)  # no eligible operator at all; messages stay pending
         busy = True
         skipped.add(conversation_id)
-    return _Pass(None, busy)
+    return _Pass(None, busy, held)
 
 
 async def _lock_operator(session: AsyncSession, account_id: int) -> bool | None:
@@ -256,7 +259,11 @@ async def _assign(
         MessageStatus.ASSIGNED,
         actor=ACTOR,
         action="message_assigned",
-        values={"operator_account_id": account_id, "assigned_at": func.now(), "review_reason": None},
+        values={
+            "operator_account_id": account_id,
+            "assigned_at": func.now(),
+            "review_reason": None,
+        },
         details={
             "conversation_id": conversation_id,
             "operator_account_id": account_id,
@@ -276,7 +283,7 @@ async def _assign(
 
 async def _hold_for_pinned_operator(
     session: AsyncSession, conversation_id: int, account_id: int
-) -> None:
+) -> bool:
     """Mark the conversation's pending messages (status stays pending), auditing each once."""
     held = await session.scalars(
         update(Message)
@@ -289,7 +296,8 @@ async def _hold_for_pinned_operator(
         .returning(Message.id)
         .execution_options(synchronize_session=False)
     )
-    for message_id in held.all():
+    message_ids = held.all()
+    for message_id in message_ids:
         await write_audit(
             session,
             ACTOR,
@@ -302,3 +310,4 @@ async def _hold_for_pinned_operator(
                 "operator_account_id": account_id,
             },
         )
+    return bool(message_ids)

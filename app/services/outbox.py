@@ -44,7 +44,9 @@ SEND_UNCERTAIN = "send_uncertain"
 ACCOUNT_RESTRICTED = "account_restricted"
 FLOOD_WAIT_LIMIT = "flood_wait_limit"
 # Accounts in these states send nothing; their queued rows wait for a human.
-_PAUSED_STATES = frozenset({AccountState.RESTRICTED, AccountState.PAUSED, AccountState.DISCONNECTED})
+_PAUSED_STATES = frozenset(
+    {AccountState.RESTRICTED, AccountState.PAUSED, AccountState.DISCONNECTED}
+)
 
 log = get_logger(__name__)
 
@@ -177,7 +179,9 @@ async def _begin_send(
     message = await _lock_message(session, message_id)
     row = (
         await session.execute(
-            select(Outbox.status, Outbox.account_id, Outbox.not_before, Outbox.attempts, Outbox.body)
+            select(
+                Outbox.status, Outbox.account_id, Outbox.not_before, Outbox.attempts, Outbox.body
+            )
             .where(Outbox.id == outbox_id)
             .with_for_update()
         )
@@ -246,11 +250,7 @@ async def _finish_send(
     max_attempts: int,
 ) -> SendStatus:
     message = await _lock_message(session, job.message_id)
-    status = SendStatus(
-        await session.scalar(
-            select(Outbox.status).where(Outbox.id == job.outbox_id).with_for_update()
-        )
-    )
+    status = await _lock_outbox_status(session, job.outbox_id)
     now = now or await _db_now(session)
     await _apply_account_effect(session, job.account_id, outcome, now)
     code = None if isinstance(outcome, SentMessage) else error_code(outcome)
@@ -310,11 +310,11 @@ async def _finish_send(
             await to_outbox(SendStatus.QUEUED, not_before=not_before)
             # Keep the claim alive until the retry is due, so recover_stale does not
             # cancel a reply that is only waiting out the flood limit.
-            lease = timedelta(seconds=get_settings().DISPATCH_LEASE_SECONDS)
+            lease_end = not_before + timedelta(seconds=get_settings().DISPATCH_LEASE_SECONDS)
             await session.execute(
                 update(Message)
                 .where(Message.id == job.message_id, Message.status == MessageStatus.PROCESSING)
-                .values(lease_expires_at=func.greatest(Message.lease_expires_at, not_before + lease))
+                .values(lease_expires_at=func.greatest(Message.lease_expires_at, lease_end))
                 .execution_options(synchronize_session=False)
             )
             return SendStatus.QUEUED
@@ -329,7 +329,7 @@ async def _finish_send(
             return SendStatus.FAILED
         case PermanentSendError():
             await to_outbox(SendStatus.FAILED)
-            await to_message(MessageStatus.FAILED, None)
+            await to_message(MessageStatus.FAILED, code)
             return SendStatus.FAILED
         case _:
             # SendTimeout or anything unexpected: delivery is unknown. Never retried
@@ -356,14 +356,18 @@ async def resolve_uncertain(
     if message_id is None:
         raise NotFound(f"outbox {outbox_id}")
     message = await _lock_message(session, message_id)
-    status = await session.scalar(
-        select(Outbox.status).where(Outbox.id == outbox_id).with_for_update()
-    )
+    status = await _lock_outbox_status(session, outbox_id)
     if status != SendStatus.UNCERTAIN:
         raise WrongState(f"outbox {outbox_id} is {status}, not uncertain")
     if outcome == "sent":
         await _mark_sent(
-            session, outbox_id, message_id, SendStatus.UNCERTAIN, message.status, None, actor,
+            session,
+            outbox_id,
+            message_id,
+            SendStatus.UNCERTAIN,
+            message.status,
+            None,
+            actor,
             strict=True,
         )
         return
@@ -403,9 +407,7 @@ async def recover_interrupted_sends(session: AsyncSession) -> int:
     recovered = 0
     for outbox_id, message_id in rows:
         message = await _lock_message(session, message_id)
-        status = await session.scalar(
-            select(Outbox.status).where(Outbox.id == outbox_id).with_for_update()
-        )
+        status = await _lock_outbox_status(session, outbox_id)
         if status != SendStatus.SENDING:
             continue
         await change_send_status(
@@ -566,7 +568,11 @@ async def _audit_account(
     session: AsyncSession, account_id: int, state: AccountState, reason: str
 ) -> None:
     await write_audit(
-        session, ACTOR, "account_state_changed", "account", account_id,
+        session,
+        ACTOR,
+        "account_state_changed",
+        "account",
+        account_id,
         {"state": state.value, "reason": reason},
     )
 
@@ -582,6 +588,13 @@ async def _lock_message(session: AsyncSession, message_id: int) -> Row[str, int 
     if message is None:
         raise NotFound(f"message {message_id}")
     return message
+
+
+async def _lock_outbox_status(session: AsyncSession, outbox_id: int) -> SendStatus:
+    status = await session.execute(
+        select(Outbox.status).where(Outbox.id == outbox_id).with_for_update()
+    )
+    return SendStatus(status.scalar_one())
 
 
 async def _peer(session: AsyncSession, conversation_id: int) -> int | str:

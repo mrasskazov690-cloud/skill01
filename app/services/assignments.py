@@ -106,8 +106,11 @@ async def _move(
     moved: list[int] = []
     for message in messages.values():
         if message is target:
-            if message.status == MessageStatus.ASSIGNED and message.operator_account_id == account_id:
-                continue
+            if (message.status, message.operator_account_id) == (
+                MessageStatus.ASSIGNED,
+                account_id,
+            ):
+                continue  # already there
             reason = AssignmentReason.MANUAL_ASSIGN
         elif pin_changes and message.status == MessageStatus.ASSIGNED:
             reason = AssignmentReason.MANUAL_REASSIGN
@@ -120,9 +123,7 @@ async def _move(
 
 async def _ensure_assignable(session: AsyncSession, account_id: int) -> None:
     account = (
-        await session.execute(
-            select(Account.kind, Account.enabled).where(Account.id == account_id)
-        )
+        await session.execute(select(Account.kind, Account.enabled).where(Account.id == account_id))
     ).one_or_none()
     if account is None:
         raise NotFound(f"account {account_id}")
