@@ -5,7 +5,7 @@ from sqlalchemy import insert, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import Account, Client, Message, Outbox
+from app.db.models import Account, Client, Draft, Message, Outbox
 from app.db.session import transaction
 from app.services.ingest import ClientRef, ingest_message
 
@@ -65,8 +65,12 @@ async def test_one_live_outbox_row_per_message(session_factory: Factory, make_ac
 
 @pytest.mark.parametrize(
     "values",
-    [{"tg_user_id": None, "username": None}, {"username": "UpperCase"}],
-    ids=["no-identity", "uppercase-username"],
+    [
+        {"tg_user_id": None, "username": None},
+        {"tg_user_id": None, "username": None, "external_key": None},
+        {"username": "UpperCase"},
+    ],
+    ids=["no-identity", "no-identity-nor-key", "uppercase-username"],
 )
 async def test_client_checks(session_factory: Factory, values: dict) -> None:
     await _expect_integrity_error(session_factory, insert(Client).values(**values))
@@ -80,3 +84,37 @@ async def test_status_checks_reject_unknown_values(session_factory: Factory, mak
     await _expect_integrity_error(
         session_factory, insert(Account).values(kind="robot", display_name="x")
     )
+
+
+async def test_client_known_by_external_key_only(session_factory: Factory) -> None:
+    async with transaction(session_factory) as s:
+        await s.execute(insert(Client).values(external_key="msg:-100/1"))
+    await _expect_integrity_error(session_factory, insert(Client).values(external_key="msg:-100/1"))
+
+
+async def test_daily_send_limit_is_not_negative(session_factory: Factory) -> None:
+    await _expect_integrity_error(
+        session_factory,
+        insert(Account).values(kind="operator", display_name="x", daily_send_limit=-1),
+    )
+
+
+async def test_one_pending_draft_per_message(session_factory: Factory, make_account) -> None:
+    message_id, account_id = await _message(session_factory, make_account)
+
+    def draft(status: str, **values: str):
+        return insert(Draft).values(
+            message_id=message_id,
+            account_id=account_id,
+            body="draft",
+            status=status,
+            **({"source": "llm"} | values),
+        )
+
+    async with transaction(session_factory) as s:
+        await s.execute(draft("rejected"))
+        await s.execute(draft("approved"))
+        await s.execute(draft("pending"))
+    await _expect_integrity_error(session_factory, draft("pending"))
+    await _expect_integrity_error(session_factory, draft("done"))
+    await _expect_integrity_error(session_factory, draft("rejected", source="human"))

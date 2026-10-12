@@ -31,3 +31,7 @@ class SendInFlight(DomainError):
 
 class IdempotencyConflict(DomainError):
     """The idempotency key is already used by an outbox row of another message."""
+
+
+class AutoModeLocked(DomainError):
+    """Auto mode needs CONFIRM_FIRST_N approved replies before it can be switched on."""

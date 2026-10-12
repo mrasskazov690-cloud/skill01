@@ -5,7 +5,8 @@ exceptions so that services/outbox can decide what to do without knowing the lib
 Exception messages must never contain client text or reply bodies.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from app.domain.states import AccountState
@@ -26,7 +27,30 @@ class PeerRef:
 
 @dataclass(frozen=True, slots=True)
 class SentMessage:
-    tg_message_id: int
+    """A delivered message. `duplicate=True`: Telegram answered RANDOM_ID_DUPLICATE, so
+    an earlier request with the same random_id was delivered; its id is unknown."""
+
+    tg_message_id: int | None
+    duplicate: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAuthor:
+    tg_user_id: int
+    username: str | None
+    display_name: str | None
+    is_bot: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WorkChatMessage:
+    chat_id: int
+    message_id: int
+    date: datetime
+    text: str
+    links: list[LeadLink] = field(default_factory=list)
+    reactions: set[str] = field(default_factory=set)
+    forwarded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +68,24 @@ class TelegramAccount(Protocol):
     @property
     def account_id(self) -> int: ...
 
-    async def send_text(self, peer: PeerRef, text: str) -> SentMessage: ...
+    async def fetch_work_chat(
+        self, chat_id: int, *, min_id: int = 0, limit: int
+    ) -> list[WorkChatMessage]:
+        """Messages newer than `min_id`, newest first, at most `limit`."""
+        ...
+
+    async def resolve_author(self, link: LeadLink) -> ResolvedAuthor:
+        """The user behind a lead link: the sender of the linked message or the linked
+        profile. Raises SourceUnavailable or AuthorUnavailable."""
+        ...
+
+    async def has_dialog_with(self, tg_user_id: int) -> bool:
+        """Whether this account has sent at least one message to the user in private."""
+        ...
+
+    async def send_text(self, peer: PeerRef, text: str, *, random_id: int) -> SentMessage: ...
+
+    async def react(self, chat_id: int, message_id: int, emoji: str) -> None: ...
 
     async def check_connection(self) -> AccountHealth: ...
 
@@ -75,3 +116,23 @@ class PermanentSendError(TelegramError):
 
 class PeerInvalid(PermanentSendError):
     """The recipient does not exist or cannot be messaged."""
+
+
+class PeerMismatch(PermanentSendError):
+    """The username now points to another user than the client's tg_user_id."""
+
+
+class PrivacyRestricted(PermanentSendError):
+    """The user does not accept private messages from us (incl. PRIVACY_PREMIUM_REQUIRED)."""
+
+
+class UserBlocked(PermanentSendError):
+    """The user has blocked this account."""
+
+
+class SourceUnavailable(TelegramError):
+    """The lead's source (chat or message) cannot be read: private, deleted, not a member."""
+
+
+class AuthorUnavailable(TelegramError):
+    """The lead has no reachable user author: anonymous admin, channel, bot, deleted account."""

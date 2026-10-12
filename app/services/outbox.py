@@ -6,9 +6,10 @@ Outbox rows only change while their message row is locked (lock order: conversat
 
 import asyncio
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import ColumnElement, Row, func, select, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -40,6 +41,7 @@ from app.telegram.base import (
     SentMessage,
     TelegramAccount,
 )
+from app.telegram.links import LeadLink
 
 ACTOR = "outbox"
 SEND_UNCERTAIN = "send_uncertain"
@@ -105,6 +107,8 @@ async def enqueue_reply(
             message_id=message_id,
             account_id=account_id,
             idempotency_key=key,
+            # Fixed per row, so a retry of this very send could be recognised by Telegram.
+            random_id=secrets.randbits(63),
             kind=kind.value,
             template_id=template_id,
             template_version=template_version,
@@ -142,6 +146,7 @@ class _SendJob:
     attempt: int
     peer: PeerRef
     body: str
+    random_id: int
 
 
 async def execute_send(
@@ -167,7 +172,7 @@ async def execute_send(
     # dies now, the startup sweep finds the row in 'sending' and never re-sends it blindly.
     outcome: SentMessage | BaseException
     try:
-        outcome = await adapter.send_text(job.peer, job.body)
+        outcome = await adapter.send_text(job.peer, job.body, random_id=job.random_id)
     except (Exception, asyncio.CancelledError) as exc:
         outcome = exc
     # The result is written in its own task, so cancelling this one (again) cannot
@@ -210,7 +215,12 @@ async def _begin_send(
     row = (
         await session.execute(
             select(
-                Outbox.status, Outbox.account_id, Outbox.not_before, Outbox.attempts, Outbox.body
+                Outbox.status,
+                Outbox.account_id,
+                Outbox.not_before,
+                Outbox.attempts,
+                Outbox.body,
+                Outbox.random_id,
             )
             .where(Outbox.id == outbox_id)
             .with_for_update()
@@ -253,6 +263,8 @@ async def _begin_send(
         )
         return SendStatus.FAILED
     attempt = row.attempts + 1
+    # Rows queued before migration 0002 have none; it is fixed with the first attempt.
+    random_id = row.random_id if row.random_id is not None else secrets.randbits(63)
     await change_send_status(
         session,
         outbox_id,
@@ -260,7 +272,7 @@ async def _begin_send(
         SendStatus.SENDING,
         actor=ACTOR,
         action="send_started",
-        values={"attempts": attempt},
+        values={"attempts": attempt, "random_id": random_id},
         details={"message_id": message_id, "account_id": account_id, "attempt": attempt},
     )
     return _SendJob(
@@ -268,8 +280,9 @@ async def _begin_send(
         message_id=message_id,
         account_id=account_id,
         attempt=attempt,
-        peer=await _peer(session, message.conversation_id),
+        peer=await _peer(session, message_id, message.conversation_id),
         body=row.body,
+        random_id=random_id,
     )
 
 
@@ -479,6 +492,12 @@ async def expire_flood_waits(session: AsyncSession, now: datetime | None = None)
     return len(ids)
 
 
+async def record_flood_wait(session: AsyncSession, account_id: int, seconds: int) -> None:
+    """A FloodWait outside a send (e.g. a dialog check): the account waits it out like
+    one from a send, so it is neither dispatched to nor sends until it expires."""
+    await _apply_account_effect(session, account_id, FloodWait(seconds), await _db_now(session))
+
+
 def error_code(exc: BaseException) -> str:
     """Stable snake_case code for an adapter error (class name only, never its message)."""
     return re.sub(r"(?<!^)(?=[A-Z])", "_", type(exc).__name__).lower()
@@ -511,9 +530,18 @@ async def _mark_sent(
     )
     template = (
         await session.execute(
-            select(Outbox.template_id, Outbox.template_version).where(Outbox.id == outbox_id)
+            select(Outbox.template_id, Outbox.template_version, Outbox.account_id).where(
+                Outbox.id == outbox_id
+            )
         )
     ).one()
+    # Senders alternate by last_sent_at (dispatcher round-robin). Account lock comes last.
+    await session.execute(
+        update(Account)
+        .where(Account.id == template.account_id)
+        .values(last_sent_at=func.clock_timestamp())
+        .execution_options(synchronize_session=False)
+    )
     change = change_message_status if strict else change_message_status_if_allowed
     await change(
         session,
@@ -638,7 +666,7 @@ async def _lock_outbox_status(session: AsyncSession, outbox_id: int) -> SendStat
     return SendStatus(status.scalar_one())
 
 
-async def _peer(session: AsyncSession, conversation_id: int) -> PeerRef:
+async def _peer(session: AsyncSession, message_id: int, conversation_id: int) -> PeerRef:
     client = (
         await session.execute(
             select(Client.tg_user_id, Client.username)
@@ -646,9 +674,16 @@ async def _peer(session: AsyncSession, conversation_id: int) -> PeerRef:
             .where(Conversation.id == conversation_id)
         )
     ).one()
+    link: dict[str, Any] | None = await session.scalar(
+        select(Message.link).where(Message.id == message_id)
+    )
     # Never a bare username: it may belong to someone else by now. The adapter checks
     # that whatever it resolves is this tg_user_id.
-    return PeerRef(tg_user_id=client.tg_user_id, username=client.username)
+    return PeerRef(
+        tg_user_id=client.tg_user_id,
+        username=client.username,
+        source=LeadLink(**link) if link else None,
+    )
 
 
 async def _db_now(session: AsyncSession) -> datetime:

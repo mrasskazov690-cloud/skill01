@@ -10,6 +10,7 @@ dependencies = [
     "alembic>=1.20",
     "pydantic-settings>=2.15",
     "structlog>=26.1",
+    "telethon==1.45.*",
 ]
 
 [dependency-groups]
@@ -31,6 +32,9 @@ asyncio_default_fixture_loop_scope = "function"
 asyncio_default_test_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "telegram_test_dc: talks to Telegram's test servers; skipped without TG_API_ID, TG_API_HASH, TG_TEST_SESSION_A and TG_TEST_SESSION_B",
+]
 
 [tool.ruff]
 line-length = 100

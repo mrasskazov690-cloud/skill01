@@ -18,6 +18,9 @@ from tests.helpers import (
     set_account,
 )
 
+# The core's FIFO order; newest_first (the default, for leads) is in test_lead_dispatch.py.
+pytestmark = pytest.mark.usefixtures("oldest_first")
+
 
 @pytest.fixture
 async def main_id(make_account) -> int:

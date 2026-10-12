@@ -108,6 +108,44 @@ async def test_successful_send(session_factory: Factory, work: tuple[int, int]) 
     assert len(adapter.calls) == 1
 
 
+async def test_adapter_gets_the_rows_random_id(
+    session_factory: Factory, work: tuple[int, int]
+) -> None:
+    message_id, operator_id = work
+    queued = await queued_reply(session_factory, message_id, operator_id)
+    assert queued.random_id is not None and 0 < queued.random_id < 2**63
+    adapter = FakeTelegramAccount(operator_id)
+    assert await _send(session_factory, queued.id, adapter) == "sent"
+    assert adapter.random_ids == [queued.random_id]
+
+
+async def test_row_without_random_id_gets_one_fixed_at_the_first_attempt(
+    session_factory: Factory, work: tuple[int, int]
+) -> None:
+    message_id, operator_id = work
+    outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+    async with transaction(session_factory) as s:  # queued before migration 0002
+        await s.execute(update(Outbox).where(Outbox.id == outbox_id).values(random_id=None))
+    adapter = FakeTelegramAccount(operator_id, [FloodWait(0)])
+    assert await _send(session_factory, outbox_id, adapter) == "queued"
+    stored = (await get(session_factory, Outbox, outbox_id)).random_id
+    assert stored is not None and adapter.random_ids == [stored]
+    assert await _send(session_factory, outbox_id, adapter) == "sent"
+    assert adapter.random_ids == [stored, stored]
+
+
+async def test_random_id_duplicate_counts_as_sent(
+    session_factory: Factory, work: tuple[int, int]
+) -> None:
+    message_id, operator_id = work
+    outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+    adapter = FakeTelegramAccount(operator_id, [SentMessage(None, duplicate=True)])
+    assert await _send(session_factory, outbox_id, adapter) == "sent"
+    row = await get(session_factory, Outbox, outbox_id)
+    assert (row.status, row.tg_sent_message_id) == ("sent", None)
+    assert (await get(session_factory, Message, message_id)).status == "answered"
+
+
 async def test_sending_is_committed_before_the_api_call(
     session_factory: Factory, work: tuple[int, int]
 ) -> None:
@@ -116,11 +154,11 @@ async def test_sending_is_committed_before_the_api_call(
     seen: dict[str, object] = {}
 
     class Probe(FakeTelegramAccount):
-        async def send_text(self, peer, text):  # type: ignore[no-untyped-def]
+        async def send_text(self, peer, text, **kwargs):  # type: ignore[no-untyped-def]
             row = await get(session_factory, Outbox, outbox_id)
             seen["row"] = (row.status, row.attempts)
             seen["open_transactions"] = await idle_in_transaction(session_factory)
-            return await super().send_text(peer, text)
+            return await super().send_text(peer, text, **kwargs)
 
     assert await _send(session_factory, outbox_id, Probe(operator_id)) == "sent"
     assert seen == {"row": ("sending", 1), "open_transactions": 0}
@@ -435,10 +473,10 @@ async def test_delivery_confirmed_after_the_sweep_is_recorded(
     outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
 
     class SlowAdapter(FakeTelegramAccount):
-        async def send_text(self, peer, text):  # type: ignore[no-untyped-def]
+        async def send_text(self, peer, text, **kwargs):  # type: ignore[no-untyped-def]
             async with transaction(session_factory) as s:  # another process restarted
                 await recover_interrupted_sends(s)
-            return await super().send_text(peer, text)
+            return await super().send_text(peer, text, **kwargs)
 
     assert await _send(session_factory, outbox_id, SlowAdapter(operator_id)) == "sent"
     assert (await get(session_factory, Message, message_id)).status == "answered"
@@ -522,8 +560,8 @@ async def test_send_result_is_recorded_when_cancelled_meanwhile(
     tasks: list[asyncio.Task] = []
 
     class CancelledOnReturn(FakeTelegramAccount):
-        async def send_text(self, peer, text):  # type: ignore[no-untyped-def]
-            sent = await super().send_text(peer, text)
+        async def send_text(self, peer, text, **kwargs):  # type: ignore[no-untyped-def]
+            sent = await super().send_text(peer, text, **kwargs)
             # Lands while the result is being written.
             asyncio.get_running_loop().call_soon(tasks[0].cancel)
             return sent

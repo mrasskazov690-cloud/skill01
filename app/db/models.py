@@ -16,6 +16,8 @@ from app.domain.states import (
     AccountState,
     AssignmentReason,
     ConversationStatus,
+    DraftSource,
+    DraftStatus,
     MessageSource,
     MessageStatus,
     OutboxKind,
@@ -55,6 +57,10 @@ class Account(Timestamps, Base):
         check_in("kind", AccountKind),
         check_in("state", AccountState),
         sa.CheckConstraint("max_active IS NULL OR max_active >= 0", name="max_active_non_negative"),
+        sa.CheckConstraint(
+            "daily_send_limit IS NULL OR daily_send_limit >= 0",
+            name="daily_send_limit_non_negative",
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -67,19 +73,28 @@ class Account(Timestamps, Base):
     max_active: Mapped[int | None] = mapped_column(sa.Integer)  # NULL = no limit
     flood_wait_until: Mapped[datetime | None]
     last_assigned_at: Mapped[datetime | None]
+    daily_send_limit: Mapped[int | None] = mapped_column(sa.Integer)  # NULL = ACCOUNT_DAILY_LIMIT
+    last_sent_at: Mapped[datetime | None]  # set by a successful send; sender alternation
+    # Name of the environment variable holding the session, never the session itself.
+    session_env: Mapped[str | None] = mapped_column(sa.Text)
     diagnostics: Mapped[dict[str, Any]] = mapped_column(server_default=EMPTY_JSON)
 
 
 class Client(Timestamps, Base):
     __tablename__ = "clients"
     __table_args__ = (
-        sa.CheckConstraint("tg_user_id IS NOT NULL OR username IS NOT NULL", name="has_identity"),
+        sa.CheckConstraint(
+            "tg_user_id IS NOT NULL OR username IS NOT NULL OR external_key IS NOT NULL",
+            name="has_identity",
+        ),
         sa.CheckConstraint("username = lower(username)", name="username_lowercase"),
     )
 
     id: Mapped[int] = _pk()
     tg_user_id: Mapped[int | None] = mapped_column(BigId, unique=True)
     username: Mapped[str | None] = mapped_column(sa.Text, unique=True)
+    # Lead whose author could not be determined: `msg:<chat>/<message_id>`.
+    external_key: Mapped[str | None] = mapped_column(sa.Text, unique=True)
     display_name: Mapped[str | None] = mapped_column(sa.Text)
 
 
@@ -132,6 +147,9 @@ class Message(Base):
     tg_message_id: Mapped[int] = mapped_column(BigId)
     conversation_id: Mapped[int] = mapped_column(sa.ForeignKey("conversations.id"), index=True)
     text: Mapped[str] = mapped_column(sa.Text)
+    text_hash: Mapped[str | None] = mapped_column(sa.Text, index=True)  # services.leads.text_hash
+    link: Mapped[dict[str, Any] | None]  # the parsed LeadLink of a work-chat lead
+    reaction: Mapped[str | None] = mapped_column(sa.Text)  # the reaction we put on the lead
     meta: Mapped[dict[str, Any]] = mapped_column(server_default=EMPTY_JSON)
     status: Mapped[str] = mapped_column(sa.Text, server_default=MessageStatus.PENDING.value)
     operator_account_id: Mapped[int | None] = mapped_column(
@@ -198,6 +216,8 @@ class Outbox(Base):
     message_id: Mapped[int] = mapped_column(sa.ForeignKey("messages.id"))
     account_id: Mapped[int] = mapped_column(sa.ForeignKey("accounts.id"))
     idempotency_key: Mapped[str] = mapped_column(sa.Text, unique=True)
+    # MTProto random_id of the send, fixed at enqueue (63-bit, positive).
+    random_id: Mapped[int | None] = mapped_column(BigId, unique=True)
     kind: Mapped[str] = mapped_column(sa.Text)
     template_id: Mapped[int | None] = mapped_column(sa.ForeignKey("templates.id"))
     template_version: Mapped[int | None] = mapped_column(sa.Integer)
@@ -212,6 +232,34 @@ class Outbox(Base):
         server_default=sa.func.now(), onupdate=sa.func.now()
     )
     sent_at: Mapped[datetime | None]
+
+
+class Draft(Base):
+    """A reply waiting for the owner's decision (confirm-first mode, guard issues)."""
+
+    __tablename__ = "drafts"
+    __table_args__ = (
+        check_in("source", DraftSource),
+        check_in("status", DraftStatus),
+        # At most one undecided draft per message.
+        sa.Index(
+            "uq_drafts_pending_message",
+            "message_id",
+            unique=True,
+            postgresql_where=sa.text(f"status = '{DraftStatus.PENDING.value}'"),
+        ),
+    )
+
+    id: Mapped[int] = _pk()
+    message_id: Mapped[int] = mapped_column(sa.ForeignKey("messages.id"))
+    account_id: Mapped[int] = mapped_column(sa.ForeignKey("accounts.id"))
+    body: Mapped[str] = mapped_column(sa.Text)
+    source: Mapped[str] = mapped_column(sa.Text)
+    status: Mapped[str] = mapped_column(sa.Text, server_default=DraftStatus.PENDING.value)
+    issues: Mapped[list[str]] = mapped_column(JSONB, server_default=sa.text("'[]'::jsonb"))
+    created_at: Mapped[datetime] = _now()
+    decided_at: Mapped[datetime | None]
+    decided_by: Mapped[str | None] = mapped_column(sa.Text)
 
 
 class AuditLog(Base):

@@ -61,6 +61,18 @@ class OutboxKind(StrEnum):
     MANUAL = "manual"
 
 
+class DraftSource(StrEnum):
+    TEMPLATE = "template"
+    LLM = "llm"
+    MANUAL = "manual"
+
+
+class DraftStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 _M = MessageStatus
 ALLOWED_TRANSITIONS: Mapping[MessageStatus, frozenset[MessageStatus]] = MappingProxyType(
     {

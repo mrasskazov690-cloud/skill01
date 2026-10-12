@@ -143,7 +143,7 @@ async def test_recover_stale_with_send_in_flight_goes_to_review(
     probe: dict[str, int] = {}
 
     class RecoveringAdapter(FakeTelegramAccount):
-        async def send_text(self, peer, text):  # type: ignore[no-untyped-def]
+        async def send_text(self, peer, text, **kwargs):  # type: ignore[no-untyped-def]
             # The lease runs out while the API call is in flight.
             probe["recovered"] = await _recover(session_factory)
             raise SendTimeout

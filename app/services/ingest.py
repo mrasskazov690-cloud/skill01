@@ -1,7 +1,7 @@
 """Idempotent intake of incoming Telegram messages."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, NamedTuple
 
 from sqlalchemy import func, or_, select, update
@@ -13,6 +13,8 @@ from app.db.models import Client, Conversation, Message
 from app.domain.errors import DomainError
 from app.domain.states import MessageSource, MessageStatus
 from app.services.audit import write_audit
+from app.services.leads import text_hash
+from app.telegram.links import LeadLink
 
 # Concurrent first-time inserts converge after one retry; running out means a bug.
 _MAX_ATTEMPTS = 3
@@ -20,11 +22,13 @@ _MAX_ATTEMPTS = 3
 
 @dataclass(frozen=True, slots=True)
 class ClientRef:
-    """How the client is known: Telegram user id and/or @username."""
+    """How the client is known: Telegram user id and/or @username. A lead whose author
+    could not be determined gets `external_key` (`msg:<chat>/<message_id>`) instead."""
 
     tg_user_id: int | None = None
     username: str | None = None
     display_name: str | None = None
+    external_key: str | None = None
 
     @property
     def normalized_username(self) -> str | None:
@@ -52,6 +56,7 @@ async def ingest_message(
     text: str,
     meta: Mapping[str, Any] | None = None,
     source_chat_id: int | None = None,
+    link: LeadLink | None = None,
 ) -> IngestResult:
     """Store a message once per (source_account_id, tg_chat_id, tg_message_id).
 
@@ -81,6 +86,8 @@ async def ingest_message(
             tg_message_id=tg_message_id,
             conversation_id=conversation_id,
             text=text,
+            text_hash=text_hash(text),
+            link=asdict(link) if link is not None else None,
             meta=dict(meta or {}),
             status=MessageStatus.PENDING.value,
         )
@@ -136,7 +143,9 @@ async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
     A client found by tg_user_id gets the username it shows up with now."""
     username = ref.normalized_username
     if ref.tg_user_id is None and username is None:
-        raise ValueError("client needs tg_user_id or username")
+        if ref.external_key is None:
+            raise ValueError("client needs tg_user_id, username or external_key")
+        return await _resolve_external_client(session, ref.external_key)
 
     for _ in range(_MAX_ATTEMPTS):
         if ref.tg_user_id is not None:
@@ -177,6 +186,24 @@ async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
         )
         if created is not None:
             return created
+    raise IngestConflict("client upsert did not converge")
+
+
+async def _resolve_external_client(session: AsyncSession, external_key: str) -> int:
+    """A lead with an unknown author: its own client, found again by the same key."""
+    for _ in range(_MAX_ATTEMPTS):
+        client_id = await session.scalar(
+            insert(Client)
+            .values(external_key=external_key)
+            .on_conflict_do_nothing(index_elements=["external_key"])
+            .returning(Client.id)
+        )
+        if client_id is None:
+            client_id = await session.scalar(
+                select(Client.id).where(Client.external_key == external_key)
+            )
+        if client_id is not None:
+            return client_id
     raise IngestConflict("client upsert did not converge")
 
 

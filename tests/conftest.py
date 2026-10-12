@@ -6,6 +6,7 @@ Tables are truncated before every test that uses the `engine` fixture.
 """
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -19,8 +20,10 @@ from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import NullPool, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.config import Settings, get_settings
 from app.db import models  # noqa: F401  (registers tables)
 from app.db.base import Base
 from app.db.models import Account
@@ -61,7 +64,20 @@ def temporary_database(prefix: str = "dispatcher_pytest") -> Iterator[URL]:
     try:
         yield server.set(database=name)
     finally:
-        asyncio.run(_run_autocommit(server, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+        _drop_database(server, name)
+
+
+def _drop_database(server: URL, name: str, attempts: int = 5) -> None:
+    # FORCE cannot terminate a backend the role does not own (an autovacuum worker that
+    # just started on the busy new database): that refusal is transient, so retry.
+    for attempt in range(1, attempts + 1):
+        try:
+            asyncio.run(_run_autocommit(server, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
+            return
+        except ProgrammingError:
+            if attempt == attempts:
+                raise
+            time.sleep(0.2 * attempt)
 
 
 def alembic_config(url: URL) -> Config:
@@ -110,3 +126,15 @@ def make_account(
             return await create_account(s, **overrides)
 
     return _make
+
+
+@pytest.fixture
+def settings() -> Settings:
+    """The cached settings services read; change fields with monkeypatch.setattr."""
+    return get_settings()
+
+
+@pytest.fixture
+def oldest_first(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
+    """Core FIFO dispatch order (the default is newest_first, for leads)."""
+    monkeypatch.setattr(settings, "DISPATCH_ORDER", "oldest_first")

@@ -4,7 +4,7 @@ Lock order everywhere: conversation -> message -> account. Conversations and
 accounts are taken with SKIP LOCKED, so concurrent dispatchers never wait on
 each other; a skipped row counts as "busy" and is retried by dispatch_batch.
 An account is locked only when something about it can race: its round-robin
-position (last_assigned_at) or its max_active load. It is locked FOR NO KEY UPDATE:
+position (last_sent_at, last_assigned_at) or its max_active load. It is locked FOR NO KEY UPDATE:
 rows that merely reference the account (assignments, messages, outbox) hold a FK
 KEY SHARE lock on it, which must not make the operator look busy.
 """
@@ -12,12 +12,23 @@ KEY SHARE lock on it, which must not make the operator look busy.
 import asyncio
 from typing import NamedTuple
 
-from sqlalchemy import ColumnElement, and_, exists, func, insert, or_, select, update
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    and_,
+    bindparam,
+    exists,
+    func,
+    insert,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.db.models import Account, Assignment, Conversation, Message
+from app.db.models import Account, Assignment, Conversation, Message, Outbox
 from app.db.session import transaction
 from app.domain.states import (
     ACTIVE_STATUSES,
@@ -25,6 +36,7 @@ from app.domain.states import (
     AccountState,
     AssignmentReason,
     MessageStatus,
+    SendStatus,
 )
 from app.services.audit import write_audit
 from app.services.transitions import change_message_status
@@ -43,45 +55,89 @@ _active_count = (
     .correlate(Account)
     .scalar_subquery()
 )
-# SQL condition on Account: may receive new assignments right now. Statements are
-# immutable, so they are built once here instead of on every dispatch pass.
-ELIGIBLE: ColumnElement[bool] = and_(
-    Account.kind == AccountKind.OPERATOR.value,
+# Values read from the settings at execution time, so the statements below stay constant.
+_TIMEZONE = bindparam("timezone", callable_=lambda: get_settings().TIMEZONE)
+_DAILY_LIMIT = bindparam(
+    "account_daily_limit", callable_=lambda: get_settings().ACCOUNT_DAILY_LIMIT
+)
+# Midnight of the current day in TIMEZONE, as timestamptz.
+_DAY_START = func.timezone(_TIMEZONE, func.date_trunc("day", func.timezone(_TIMEZONE, func.now())))
+_sent_today = (
+    select(func.count())
+    .select_from(Outbox)
+    .where(
+        Outbox.account_id == Account.id,
+        Outbox.status == SendStatus.SENT.value,
+        Outbox.sent_at >= _DAY_START,
+    )
+    .correlate(Account)
+    .scalar_subquery()
+)
+# SQL condition on Account: may send right now (switched on, on shift, not limited by
+# Telegram, under its daily limit). Checked again at send time, because a reply may be
+# queued or left assigned long after its assignment (approved drafts, resumed leads).
+# Statements are immutable, so they are built once here instead of on every pass.
+CAN_SEND: ColumnElement[bool] = and_(
     Account.enabled.is_(True),
     Account.on_shift.is_(True),
     Account.state == AccountState.ACTIVE.value,
     or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= func.now()),
+    _sent_today < func.coalesce(Account.daily_send_limit, _DAILY_LIMIT),
+)
+# SQL condition on Account: may receive new assignments right now.
+ELIGIBLE: ColumnElement[bool] = and_(
+    Account.kind == AccountKind.OPERATOR.value,
+    CAN_SEND,
     or_(Account.max_active.is_(None), _active_count < Account.max_active),
 )
 
-_PENDING = (
-    select(Message.id, Message.conversation_id, Message.received_at)
-    .join(Conversation, Conversation.id == Message.conversation_id)
-    .where(
-        Message.status == MessageStatus.PENDING.value,
-        # Messages already held for an unavailable pinned operator are skipped until
-        # that operator is eligible again: otherwise they would hog the candidate
-        # window (starving newer messages) and add an audit row on every pass.
-        or_(
-            Message.review_reason.is_distinct_from(PINNED_OPERATOR_UNAVAILABLE),
-            Conversation.operator_account_id.is_(None),
-            exists().where(Account.id == Conversation.operator_account_id, ELIGIBLE),
-        ),
-    )
-    # One candidate per conversation, its oldest message: a conversation that is locked
-    # or has a long backlog takes one slot of the window, not all of them.
-    .ext(distinct_on(Message.conversation_id))
-    .order_by(Message.conversation_id, Message.received_at, Message.id)
-    .subquery()
-)
-_CANDIDATES = select(_PENDING.c.id, _PENDING.c.conversation_id).order_by(
-    _PENDING.c.received_at, _PENDING.c.id
-)
 
+def _candidates(newest_first: bool) -> Select[tuple[int, int]]:
+    order = (
+        (Message.received_at.desc(), Message.id.desc())
+        if newest_first
+        else (Message.received_at, Message.id)
+    )
+    pending = (
+        select(Message.id, Message.conversation_id, Message.received_at)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Message.status == MessageStatus.PENDING.value,
+            # Messages already held for an unavailable pinned operator are skipped until
+            # that operator is eligible again: otherwise they would hog the candidate
+            # window (starving newer messages) and add an audit row on every pass.
+            or_(
+                Message.review_reason.is_distinct_from(PINNED_OPERATOR_UNAVAILABLE),
+                Conversation.operator_account_id.is_(None),
+                exists().where(Account.id == Conversation.operator_account_id, ELIGIBLE),
+            ),
+        )
+        # One candidate per conversation, the first in dispatch order: a conversation
+        # that is locked or has a long backlog takes one slot of the window, not all.
+        .ext(distinct_on(Message.conversation_id))
+        .order_by(Message.conversation_id, *order)
+        .subquery()
+    )
+    outer = (
+        (pending.c.received_at.desc(), pending.c.id.desc())
+        if newest_first
+        else (pending.c.received_at, pending.c.id)
+    )
+    return select(pending.c.id, pending.c.conversation_id).order_by(*outer)
+
+
+_CANDIDATES = {"newest_first": _candidates(True), "oldest_first": _candidates(False)}
+
+# Senders alternate: the account that sent least recently goes first. Among accounts
+# with the same last_sent_at (none sent yet) the least recently assigned one does.
 _ROUND_ROBIN_ORDER = (
-    select(Account.id, Account.last_assigned_at)
+    select(Account.id, Account.last_sent_at, Account.last_assigned_at)
     .where(ELIGIBLE)
-    .order_by(Account.last_assigned_at.asc().nulls_first(), Account.id)
+    .order_by(
+        Account.last_sent_at.asc().nulls_first(),
+        Account.last_assigned_at.asc().nulls_first(),
+        Account.id,
+    )
 )
 
 
@@ -133,7 +189,8 @@ async def dispatch_batch(
 
 async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> _Pass:
     limit = candidate_limit or get_settings().DISPATCH_CANDIDATE_LIMIT
-    candidates = (await session.execute(_CANDIDATES.limit(limit))).all()
+    candidates_stmt = _CANDIDATES[get_settings().DISPATCH_ORDER]
+    candidates = (await session.execute(candidates_stmt.limit(limit))).all()
     busy = held = operators_busy = False
     for message_id, conversation_id in candidates:
         conversation = (
@@ -219,22 +276,26 @@ async def _lock_operator(session: AsyncSession, account_id: int) -> bool | None:
 
 
 async def _lock_round_robin(session: AsyncSession) -> tuple[int | None, bool]:
-    """Pick and lock the least recently assigned eligible operator.
+    """Pick and lock the eligible operator whose turn it is (see _ROUND_ROBIN_ORDER).
 
     Returns (account_id, False) on success, (None, True) when eligible operators exist
     but all are locked by other transactions, (None, False) when none is eligible.
     """
     # Not one `ORDER BY ... LIMIT 1 FOR UPDATE SKIP LOCKED`: under READ COMMITTED that
-    # sorts by the statement snapshot and may lock a row whose last_assigned_at was
-    # just moved by a concurrent commit, giving one operator two turns in a row.
+    # sorts by the statement snapshot and may lock a row whose position was just moved
+    # by a concurrent commit, giving one operator two turns in a row.
     # Instead walk the order and lock a row only if its position is still the one seen.
     order = (await session.execute(_ROUND_ROBIN_ORDER)).all()
     busy = False
-    for account_id, seen in order:
+    for account_id, seen_sent, seen_assigned in order:
         savepoint = await session.begin_nested()
         locked = await session.scalar(
             select(Account.id)
-            .where(Account.id == account_id, Account.last_assigned_at.is_not_distinct_from(seen))
+            .where(
+                Account.id == account_id,
+                Account.last_sent_at.is_not_distinct_from(seen_sent),
+                Account.last_assigned_at.is_not_distinct_from(seen_assigned),
+            )
             .with_for_update(skip_locked=True, key_share=True)  # FOR NO KEY UPDATE
         )
         # Fresh statement under the lock: sees assignments committed meanwhile (max_active).
