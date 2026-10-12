@@ -48,8 +48,6 @@ _PAUSED_STATES = frozenset(
     {AccountState.RESTRICTED, AccountState.PAUSED, AccountState.DISCONNECTED}
 )
 
-log = get_logger(__name__)
-
 
 def default_idempotency_key(message_id: int) -> str:
     return f"msg:{message_id}:reply"
@@ -85,8 +83,6 @@ async def enqueue_reply(
         return existing
     if message.operator_account_id != account_id:
         raise NotOwner(f"message {message_id} is not assigned to account {account_id}")
-    if message.status != MessageStatus.PROCESSING:
-        raise WrongState(f"message {message_id} is {message.status}, not processing")
     live = await session.scalar(
         select(Outbox.id).where(
             Outbox.message_id == message_id,
@@ -95,6 +91,8 @@ async def enqueue_reply(
     )
     if live is not None:
         raise SendInFlight(f"message {message_id} already has live outbox row {live}")
+    if message.status != MessageStatus.PROCESSING:
+        raise WrongState(f"message {message_id} is {message.status}, not processing")
     # ON CONFLICT also covers uq_outbox_live_message, the database-level guarantee.
     outbox_id = await session.scalar(
         pg_insert(Outbox)
@@ -255,7 +253,7 @@ async def _finish_send(
     await _apply_account_effect(session, job.account_id, outcome, now)
     code = None if isinstance(outcome, SentMessage) else error_code(outcome)
     if code is not None and not isinstance(outcome, FloodWait | PeerFlood | PermanentSendError):
-        log.warning("send_result_uncertain", outbox_id=job.outbox_id, error=code)
+        get_logger(__name__).warning("send_result_uncertain", outbox_id=job.outbox_id, error=code)
 
     if status != SendStatus.SENDING:
         # The startup sweep already marked the row uncertain; only a confirmed delivery

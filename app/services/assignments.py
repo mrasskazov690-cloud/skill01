@@ -12,6 +12,7 @@ from app.domain.states import (
     AssignmentReason,
     InvalidTransition,
     MessageStatus,
+    ensure_transition,
 )
 from app.services.audit import write_audit
 from app.services.dispatcher import PINNED_OPERATOR_UNAVAILABLE
@@ -98,6 +99,8 @@ async def _move(
     busy = sorted(m.id for m in affected if m.status == MessageStatus.PROCESSING or m.id in live)
     if busy:
         raise ConversationBusy(f"conversation {conversation_id}: messages {busy} are in work")
+    if target is not None:
+        ensure_transition(target.status, MessageStatus.ASSIGNED)  # fail before any write
 
     if pin_changes:
         pin_reason = AssignmentReason.MANUAL_ASSIGN if target else AssignmentReason.MANUAL_REASSIGN

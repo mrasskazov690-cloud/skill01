@@ -10,7 +10,6 @@ from typing import NamedTuple
 
 from sqlalchemy import (
     ColumnElement,
-    Select,
     and_,
     exists,
     func,
@@ -39,32 +38,55 @@ ACTOR = "dispatcher"
 PINNED_OPERATOR_UNAVAILABLE = "pinned_operator_unavailable"
 
 
-def eligible_clause() -> ColumnElement[bool]:
-    """SQL condition on Account: may receive new assignments right now."""
-    active_count = (
-        select(func.count())
-        .select_from(Message)
-        .where(
-            Message.operator_account_id == Account.id,
-            Message.status.in_([s.value for s in ACTIVE_STATUSES]),
-        )
-        .correlate(Account)
-        .scalar_subquery()
+_active_count = (
+    select(func.count())
+    .select_from(Message)
+    .where(
+        Message.operator_account_id == Account.id,
+        Message.status.in_([s.value for s in ACTIVE_STATUSES]),
     )
-    return and_(
-        Account.kind == AccountKind.OPERATOR.value,
-        Account.enabled.is_(True),
-        Account.on_shift.is_(True),
-        Account.state == AccountState.ACTIVE.value,
-        or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= func.now()),
-        or_(Account.max_active.is_(None), active_count < Account.max_active),
+    .correlate(Account)
+    .scalar_subquery()
+)
+# SQL condition on Account: may receive new assignments right now. Statements are
+# immutable, so they are built once here instead of on every dispatch pass.
+ELIGIBLE: ColumnElement[bool] = and_(
+    Account.kind == AccountKind.OPERATOR.value,
+    Account.enabled.is_(True),
+    Account.on_shift.is_(True),
+    Account.state == AccountState.ACTIVE.value,
+    or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= func.now()),
+    or_(Account.max_active.is_(None), _active_count < Account.max_active),
+)
+
+_CANDIDATES = (
+    select(Message.id, Message.conversation_id)
+    .join(Conversation, Conversation.id == Message.conversation_id)
+    .where(
+        Message.status == MessageStatus.PENDING.value,
+        # Messages already held for an unavailable pinned operator are skipped until
+        # that operator is eligible again: otherwise they would hog the candidate
+        # window (starving newer messages) and add an audit row on every pass.
+        or_(
+            Message.review_reason.is_distinct_from(PINNED_OPERATOR_UNAVAILABLE),
+            Conversation.operator_account_id.is_(None),
+            exists().where(Account.id == Conversation.operator_account_id, ELIGIBLE),
+        ),
     )
+    .order_by(Message.received_at, Message.id)
+)
+
+_ROUND_ROBIN = (
+    select(Account.id)
+    .where(ELIGIBLE)
+    .order_by(Account.last_assigned_at.asc().nulls_first(), Account.id)
+    .limit(1)
+    .with_for_update(skip_locked=True)
+)
 
 
 async def is_eligible(session: AsyncSession, account_id: int) -> bool:
-    return bool(
-        await session.scalar(select(exists().where(Account.id == account_id, eligible_clause())))
-    )
+    return bool(await session.scalar(select(exists().where(Account.id == account_id, ELIGIBLE))))
 
 
 class _Pass(NamedTuple):
@@ -109,32 +131,9 @@ async def dispatch_batch(
     return assigned
 
 
-def _candidates(limit: int) -> Select[int, int]:
-    pinned_operator_eligible = exists().where(
-        Account.id == Conversation.operator_account_id, eligible_clause()
-    )
-    return (
-        select(Message.id, Message.conversation_id)
-        .join(Conversation, Conversation.id == Message.conversation_id)
-        .where(
-            Message.status == MessageStatus.PENDING.value,
-            # Messages already held for an unavailable pinned operator are skipped until
-            # that operator is eligible again: otherwise they would hog the candidate
-            # window (starving newer messages) and add an audit row on every pass.
-            or_(
-                Message.review_reason.is_distinct_from(PINNED_OPERATOR_UNAVAILABLE),
-                Conversation.operator_account_id.is_(None),
-                pinned_operator_eligible,
-            ),
-        )
-        .order_by(Message.received_at, Message.id)
-        .limit(limit)
-    )
-
-
 async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> _Pass:
     limit = candidate_limit or get_settings().DISPATCH_CANDIDATE_LIMIT
-    candidates = (await session.execute(_candidates(limit))).all()
+    candidates = (await session.execute(_CANDIDATES.limit(limit))).all()
     busy = held = False
     skipped: set[int] = set()
     for message_id, conversation_id in candidates:
@@ -214,11 +213,7 @@ async def _lock_round_robin(session: AsyncSession) -> tuple[int | None, bool]:
     while True:
         savepoint = await session.begin_nested()
         account_id = await session.scalar(
-            select(Account.id)
-            .where(eligible_clause(), Account.id.not_in(excluded) if excluded else true())
-            .order_by(Account.last_assigned_at.asc().nulls_first(), Account.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
+            _ROUND_ROBIN.where(Account.id.not_in(excluded)) if excluded else _ROUND_ROBIN
         )
         if account_id is not None and await is_eligible(session, account_id):
             await savepoint.commit()
@@ -226,7 +221,7 @@ async def _lock_round_robin(session: AsyncSession) -> tuple[int | None, bool]:
         await savepoint.rollback()
         if account_id is None:
             remaining = exists().where(
-                eligible_clause(), Account.id.not_in(excluded) if excluded else true()
+                ELIGIBLE, Account.id.not_in(excluded) if excluded else true()
             )
             return None, bool(await session.scalar(select(remaining)))
         excluded.append(account_id)  # reached max_active since the locking SELECT's snapshot
