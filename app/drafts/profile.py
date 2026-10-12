@@ -5,13 +5,23 @@ reviews); `profile.example.yaml` in the repository shows the format with placeho
 It is loaded and validated once at startup.
 """
 
-# ruff: noqa: RUF003  (Russian examples in comments)
+# ruff: noqa: RUF001, RUF003  (Russian phrases and examples by design)
 
+import re
 from pathlib import Path
 from typing import Annotated
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from app.logging import get_logger
+
+# A disclosure phrase must name the tie itself: cooperation, work, representation,
+# partnership. "советую сервис" / "рекомендую сервис" only advocate and disclose nothing.
+_TIE = re.compile(
+    r"(?<![а-яa-z])(?:сотруднича|сотрудничеств|сотрудник|работа[юе]|представля"
+    r"|партн[её]р|агент)"
+)
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -33,7 +43,8 @@ class ServiceProfile(BaseModel):
     facts: tuple[Text, ...] = Field(min_length=1)
     reviews: tuple[Review, ...] = ()
     # Phrases that disclose the tie to the service ("сотрудничаю", "работаю с"): a
-    # draft without one of them is never sent automatically.
+    # draft without one of them is never sent automatically. Only the phrases that
+    # name the tie count (see `disclosures`); at least one must.
     disclosure_phrases: tuple[Text, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -42,6 +53,25 @@ class ServiceProfile(BaseModel):
         if len(ids) != len(set(ids)):
             raise ValueError("review ids must be unique")
         return self
+
+    @model_validator(mode="after")
+    def _discloses_the_tie(self) -> "ServiceProfile":
+        if not self.disclosures:
+            raise ValueError(
+                "disclosure_phrases: none names the tie to the service"
+                " (сотрудничаю, работаю с, представляю)"
+            )
+        return self
+
+    @property
+    def disclosures(self) -> tuple[str, ...]:
+        """The disclosure phrases that name the tie; advocacy alone is not one."""
+        return tuple(p for p in self.disclosure_phrases if _TIE.search(_fold(p)))
+
+    @property
+    def ignored_phrases(self) -> tuple[str, ...]:
+        """Disclosure phrases that do not disclose anything and are not used."""
+        return tuple(p for p in self.disclosure_phrases if p not in self.disclosures)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -68,7 +98,7 @@ def load_profile(path: str | Path) -> ServiceProfile:
     if not isinstance(raw, dict):
         raise ProfileError(f"profile file {path} must hold a mapping")
     try:
-        return ServiceProfile.model_validate(raw)
+        profile = ServiceProfile.model_validate(raw)
     except ValueError as exc:
         # Field locations and messages only: pydantic would echo the offending input.
         problems = "; ".join(
@@ -76,3 +106,13 @@ def load_profile(path: str | Path) -> ServiceProfile:
             for err in getattr(exc, "errors", lambda: [])()
         )
         raise ProfileError(f"profile file {path} is invalid: {problems or 'bad value'}") from None
+    if profile.ignored_phrases:
+        # The phrases are settings, not customer data.
+        get_logger(__name__).warning(
+            "profile_disclosure_phrases_ignored", phrases=list(profile.ignored_phrases)
+        )
+    return profile
+
+
+def _fold(text: str) -> str:
+    return text.lower().replace("ё", "е")

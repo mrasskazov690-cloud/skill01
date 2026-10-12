@@ -1,5 +1,7 @@
 """The service profile: loading, validation, and the example in the repository."""
 
+# ruff: noqa: RUF001  (Russian phrases by design)
+
 from pathlib import Path
 
 import pytest
@@ -92,3 +94,21 @@ def test_profile_is_frozen() -> None:
     with pytest.raises(ValueError):
         profile.name = "Other"  # type: ignore[misc]
     assert isinstance(profile, ServiceProfile)
+
+
+def test_advocacy_phrases_do_not_count_as_disclosure(tmp_path: Path) -> None:
+    text = VALID.replace(
+        "disclosure_phrases: [сотрудничаю]",
+        "disclosure_phrases: [сотрудничаю, работаю с, советую сервис, рекомендую сервис]",
+    )
+    profile = load_profile(_write(tmp_path, text))
+    assert profile.disclosures == ("сотрудничаю", "работаю с")
+    assert profile.ignored_phrases == ("советую сервис", "рекомендую сервис")
+
+
+def test_a_profile_without_a_real_disclosure_is_refused(tmp_path: Path) -> None:
+    text = VALID.replace(
+        "disclosure_phrases: [сотрудничаю]", "disclosure_phrases: [советую сервис]"
+    )
+    with pytest.raises(ProfileError, match="disclosure_phrases"):
+        load_profile(_write(tmp_path, text))

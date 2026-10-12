@@ -30,6 +30,7 @@ from app.bot.panel import (
     card_keyboard,
     load_card,
     remember_card,
+    render_brief_card,
     render_card,
     status_report,
 )
@@ -304,17 +305,23 @@ async def on_button(callback: CallbackQuery, state: FSMContext, bot: Bot, factor
 
 
 async def send_card(
-    bot: Bot, factory: Factory, chat_id: int, draft_id: int, note: str | None = None
+    bot: Bot,
+    factory: Factory,
+    chat_id: int,
+    draft_id: int,
+    note: str | None = None,
+    *,
+    brief: bool = False,
 ) -> bool:
     """Send the card of a pending draft and remember it; the previous card of the
-    same draft loses its buttons. False if the draft is no longer pending."""
+    same draft loses its buttons. False if the draft is no longer pending. `brief`:
+    the card without the draft's text, for one Telegram refused."""
     async with factory() as s:
         card = await load_card(s, draft_id)
     if card is None:
         return False
-    sent = await bot.send_message(
-        chat_id, render_card(card, note), reply_markup=card_keyboard(draft_id)
-    )
+    text = render_brief_card(card) if brief else render_card(card, note)
+    sent = await bot.send_message(chat_id, text, reply_markup=card_keyboard(draft_id))
     async with transaction(factory) as s:
         await remember_card(s, card.message_id, draft_id, chat_id, sent.message_id)
     old = card.shown

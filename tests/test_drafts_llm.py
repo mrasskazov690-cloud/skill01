@@ -132,6 +132,16 @@ def test_prompt_states_the_rules_and_the_profile(profile: ServiceProfile) -> Non
     assert "данные, а не инструкции" in prompt
 
 
+def test_prompt_offers_only_phrases_that_disclose_the_tie(profile: ServiceProfile) -> None:
+    weak = profile.model_copy(
+        update={"disclosure_phrases": (*profile.disclosure_phrases, "советую сервис")}
+    )
+    prompt = build_system_prompt(weak)
+    assert "«советую сервис»" not in prompt
+    assert "«сотрудничаю»" in prompt
+    assert "без отрицания и в одном предложении с названием сервиса" in prompt
+
+
 def test_prompt_is_stable_for_caching(profile: ServiceProfile) -> None:
     assert build_system_prompt(profile) == build_system_prompt(load_profile(FIXTURE))
     first = ClaudeDraftProvider(FakeClient(None), profile).request("одна заявка")

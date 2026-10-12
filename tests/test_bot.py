@@ -17,7 +17,7 @@ import pytest
 import structlog
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageReplyMarkup,
@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.bot import __main__ as bot_entry
 from app.bot.handlers import FOREIGN_USER, build_dispatcher
 from app.bot.notifier import CardNotifier
-from app.bot.panel import CARD_KEY
+from app.bot.panel import CARD_BODY_LIMIT, CARD_KEY
 from app.config import Settings
 from app.db.models import AuditLog, Draft, Outbox
 from app.db.models import Message as Lead
@@ -507,6 +507,60 @@ async def test_card_that_cannot_be_delivered_is_tried_again(panel: Panel) -> Non
 
     panel.session.fail_with = None
     assert await notifier.send_new_cards() == 1
+
+
+async def test_a_long_draft_is_cut_to_fit_the_card(panel: Panel) -> None:
+    body = GOOD + " " + "а" * 5000
+    draft = await panel.draft(body=body)
+    assert await CardNotifier(panel.bot, panel.factory, OWNER).send_new_cards() == 1
+    text = panel.session.texts()[0]
+    assert len(text) < 4096
+    assert f"Показано {CARD_BODY_LIMIT} из {len(body)} символов" in text
+    # Only the card is cut: "Отправить" sends the whole draft.
+    await panel.press(f"send:{draft.id}")
+    assert (await rows(panel.factory, Outbox))[0].body == body
+
+
+def _refuse(panel: Panel, marker: str) -> None:
+    """Telegram refuses (400) every message that contains `marker`."""
+    original = panel.session.make_request
+
+    async def make_request(bot: Bot, method: Any, timeout: int | None = None) -> Any:  # noqa: ASYNC109
+        if isinstance(method, SendMessage) and marker in method.text:
+            raise TelegramBadRequest(method=method, message="Bad Request: can't parse entities")
+        return await original(bot, method, timeout)
+
+    panel.session.make_request = make_request  # type: ignore[method-assign]
+
+
+async def test_a_refused_card_does_not_hold_up_the_next_ones(panel: Panel) -> None:
+    refused = await panel.draft(client=1, body=GOOD + " ОТКАЗ")
+    later = await panel.draft(client=2)
+    _refuse(panel, "ОТКАЗ")
+    notifier = CardNotifier(panel.bot, panel.factory, OWNER)
+
+    assert await notifier.send_new_cards() == 2
+    texts = panel.session.texts()
+    assert f"черновик #{later.id}" in texts[1] and "<blockquote>" in texts[1]
+    # The refused draft gets a brief card with working buttons instead.
+    assert f"черновик #{refused.id}" in texts[0]
+    assert "Telegram не принял карточку" in texts[0]
+    card = panel.session.of(SendMessage)[0]
+    buttons = [b.callback_data for b in card.reply_markup.inline_keyboard[0]]
+    assert buttons == [f"send:{refused.id}", f"edit:{refused.id}", f"skip:{refused.id}"]
+    assert (await get(panel.factory, Lead, refused.message_id)).meta[CARD_KEY]["draft_id"] == (
+        refused.id
+    )
+    assert await notifier.send_new_cards() == 0  # one card per draft
+
+
+async def test_a_chat_that_refuses_every_card_ends_the_round(panel: Panel) -> None:
+    await panel.draft(client=1)
+    await panel.draft(client=2)
+    _refuse(panel, "черновик #")
+    notifier = CardNotifier(panel.bot, panel.factory, OWNER)
+    assert await notifier.send_new_cards() == 0
+    assert panel.session.texts() == []
 
 
 # --- privacy and the entry point ---------------------------------------------------------

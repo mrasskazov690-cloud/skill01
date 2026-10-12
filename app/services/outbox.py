@@ -16,7 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
-from app.db.models import Account, Client, Conversation, Message, Outbox
+from app.db.models import Account, AppSetting, Client, Conversation, Message, Outbox
 from app.db.session import transaction
 from app.domain.errors import IdempotencyConflict, NotFound, NotOwner, SendInFlight, WrongState
 from app.domain.states import (
@@ -48,6 +48,8 @@ ACTOR = "outbox"
 SEND_UNCERTAIN = "send_uncertain"
 ACCOUNT_RESTRICTED = "account_restricted"
 FLOOD_WAIT_LIMIT = "flood_wait_limit"
+# app_settings key of the owner's /pause (written by approvals.set_paused).
+PAUSED_SETTING = "paused"
 # Accounts in these states send nothing; their queued rows wait for a human.
 _PAUSED_STATES = frozenset(
     {AccountState.RESTRICTED, AccountState.PAUSED, AccountState.DISCONNECTED}
@@ -55,6 +57,14 @@ _PAUSED_STATES = frozenset(
 # Strong references to send-result recordings: the event loop keeps only weak ones, and
 # a recording outlives an execute_send that is cancelled while waiting for it.
 _recordings: set[asyncio.Task[SendStatus]] = set()
+
+
+async def sending_paused(session: AsyncSession) -> bool:
+    """The owner's /pause: no send starts while it is on."""
+    value: Any = await session.scalar(
+        select(AppSetting.value).where(AppSetting.key == PAUSED_SETTING)
+    )
+    return value is True
 
 
 def default_idempotency_key(message_id: int) -> str:
@@ -241,6 +251,10 @@ async def _begin_send(
         )
     ).one()
     if account.state in _PAUSED_STATES:
+        return None
+    if await sending_paused(session):
+        # /pause (read here, right before the call, so it also stops a send whose tick
+        # started before it): the row stays queued.
         return None
     if account.flood_wait_until is not None and account.flood_wait_until > now:
         await session.execute(

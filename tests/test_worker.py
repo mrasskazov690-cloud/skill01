@@ -494,6 +494,62 @@ async def test_approved_draft_waits_while_paused(env: Env) -> None:
     assert (await worker.send_tick()).message_id == drafted.message_id
 
 
+class _PausingDrafts:
+    """The owner sends /pause while the draft is being written (a Claude call)."""
+
+    def __init__(self, factory: Factory) -> None:
+        self.factory = factory
+        self.paused = False
+
+    async def draft(self, session: AsyncSession, message_id: int) -> Reply:
+        if not self.paused:
+            self.paused = True
+            async with transaction(self.factory) as s:
+                await set_paused(s, True, OWNER)
+        return Reply("Здравствуйте! Подскажите, какой район вам интересен?", DraftSource.LLM)
+
+
+async def test_pause_during_the_draft_call_stops_the_auto_send(env: Env) -> None:
+    worker = env.worker(drafts=_PausingDrafts(env.factory))
+    await _auto_mode(env.factory)
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "paused"
+    assert not any(f.calls for f in env.ops)
+    assert await rows(env.factory, Outbox) == []
+    assert (await _status(env.factory, tg_id))[0] == "assigned"  # taken up after /resume
+
+    async with transaction(env.factory) as s:
+        await set_paused(s, False, OWNER)
+    assert (await worker.send_tick()).kind == "sent"
+
+
+async def test_pause_during_the_reaction_check_stops_an_approved_send(env: Env) -> None:
+    worker = env.worker()
+    env.post(1)
+    await worker.poll_work_chat()
+    drafted = await worker.send_tick()
+    async with transaction(env.factory) as s:
+        await approve(s, drafted.message_id, OWNER)  # type: ignore[arg-type]
+    read = env.reader.fetch_reactions
+
+    async def pause_then_read(chat_id: int, message_id: int) -> set[str]:
+        async with transaction(env.factory) as s:
+            await set_paused(s, True, OWNER)
+        return await read(chat_id, message_id)
+
+    env.reader.fetch_reactions = pause_then_read  # type: ignore[method-assign]
+    await worker.send_tick()
+    assert not any(f.calls for f in env.ops)
+    assert [o.status for o in await rows(env.factory, Outbox)] == ["queued"]
+
+    env.reader.fetch_reactions = read  # type: ignore[method-assign]
+    async with transaction(env.factory) as s:
+        await set_paused(s, False, OWNER)
+    assert (await worker.send_tick()).message_id == drafted.message_id
+
+
 @pytest.mark.parametrize(
     ("outcome", "message_status", "reaction"),
     [

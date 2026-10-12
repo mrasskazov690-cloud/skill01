@@ -31,6 +31,10 @@ CARD_KEY = "bot_card"
 SEND, EDIT, SKIP = "send", "edit", "skip"
 CALLBACK = re.compile(r"(send|edit|skip):([1-9][0-9]{0,18})")
 LEAD_EXCERPT = 300  # characters of the lead shown when the provider gave no summary
+# A Bot API message holds 4096 characters: the draft is cut to fit with the rest of the
+# card ("Изменить" replaces it; "Отправить" sends the whole text).
+CARD_BODY_LIMIT = 3000
+INFO_LIMIT = 200  # country and need, as the provider gave them
 
 ISSUE_LABELS: Mapping[str, str] = {
     "price": "цена",
@@ -147,9 +151,9 @@ def render_card(card: Card, note: str | None = None) -> str:
     country = card.info.get("country")
     need = card.info.get("need")
     if country:
-        lines.append(f"Страна: {e(str(country))}")
+        lines.append(f"Страна: {e(_clip(str(country), INFO_LIMIT))}")
     if need:
-        lines.append(f"Запрос: {e(str(need))}")
+        lines.append(f"Запрос: {e(_clip(str(need), INFO_LIMIT))}")
     else:
         excerpt = card.lead_text.strip()
         if len(excerpt) > LEAD_EXCERPT:
@@ -160,13 +164,37 @@ def render_card(card: Card, note: str | None = None) -> str:
     if card.chat_url:
         lines.append(f"В рабочем чате: {e(card.chat_url)}")
     source = SOURCE_LABELS.get(card.source, card.source)
-    lines += ["", f"<b>Черновик</b> ({e(source)}):", f"<blockquote>{e(card.body)}</blockquote>"]
+    lines += [
+        "",
+        f"<b>Черновик</b> ({e(source)}):",
+        f"<blockquote>{e(_clip(card.body))}</blockquote>",
+    ]
+    if len(card.body) > CARD_BODY_LIMIT:
+        lines.append(
+            f"(Показано {CARD_BODY_LIMIT} из {len(card.body)} символов; «Отправить» отправит"
+            " весь текст.)"
+        )
     if card.issues:
         labels = ", ".join(ISSUE_LABELS.get(code, code) for code in card.issues)
         lines.append(f"⚠️ <b>Проверка:</b> {e(labels)}. Отправляйте, только если это верно.")
     else:
         lines.append("✅ Проверка пройдена")
     return "\n".join(lines)
+
+
+def render_brief_card(card: Card) -> str:
+    """A card Telegram refused (e.g. too long) is replaced by this one: the buttons
+    still work, "Изменить" replaces the text."""
+    return (
+        f"<b>Заявка #{card.message_id}</b> · черновик #{card.draft_id} · "
+        f"аккаунт {html.escape(card.account_name)} (#{card.account_id})\n"
+        "⚠️ Telegram не принял карточку с текстом черновика. Нажмите «Изменить», чтобы"
+        " прислать новый текст, или «Пропустить»."
+    )
+
+
+def _clip(text: str, limit: int = CARD_BODY_LIMIT) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
 def card_keyboard(draft_id: int) -> InlineKeyboardMarkup:

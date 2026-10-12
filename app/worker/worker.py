@@ -553,6 +553,15 @@ class Worker:
                 # It looked taken or a duplicate a moment ago and no longer does: the
                 # next tick drafts it.
                 return None
+            issues: list[str] = []
+            auto = False
+            if isinstance(reply, Reply):
+                issues = check_draft(reply.body, reply.source, self.profile)
+                auto = not issues and await is_auto_mode(s)
+                if auto and await is_paused(s):
+                    # /pause came while the draft was being written: nothing goes out.
+                    # The lead stays assigned and is taken up again after /resume.
+                    return TickResult("paused", lead.message_id, lead.account_id)
             await claim_message(s, lead.message_id, lead.account_id, self.name)
             if isinstance(reply, NoDraft):
                 await self._save_draft_info(s, lead.message_id, reply.info)
@@ -579,8 +588,7 @@ class Worker:
                 )
                 return None
             await self._save_draft_info(s, lead.message_id, reply.info)
-            issues = check_draft(reply.body, reply.source, self.profile)
-            if issues or not await is_auto_mode(s):
+            if not auto:
                 await create_draft(
                     s,
                     message_id=lead.message_id,

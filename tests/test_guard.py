@@ -1,4 +1,4 @@
-# ruff: noqa: RUF001  (Russian reply texts by design)
+# ruff: noqa: RUF001, RUF003  (Russian reply texts by design)
 
 from pathlib import Path
 
@@ -102,6 +102,45 @@ def test_no_disclosure(body: str) -> None:
 @pytest.mark.parametrize(
     "body",
     [
+        # Negated: an explicit denial of the tie.
+        "Я не сотрудничаю с Chit Trip, просто советую: жильё без предоплаты.",
+        "Я никогда не работаю с Chit Trip, но советую их.",
+        # Third person: "сотрудничаю" is a substring of "сотрудничают".
+        "Многие сотрудничают с Chit Trip, советую их: жильё без предоплаты.",
+        # The phrase is not about the service.
+        "Я работаю с утра до ночи, но советую Chit Trip: жильё без предоплаты.",
+        # The name and the phrase are in different sentences.
+        "Советую Chit Trip. Я работаю с агентствами.",
+    ],
+)
+def test_disclosure_must_be_first_person_and_about_the_service(body: str) -> None:
+    assert "no_disclosure" in check_draft(body, "llm", PROFILE)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Сервис Chit Trip, с которым я сотрудничаю, поможет найти выгодно.",
+        "Добрый день! Я сотрудничаю с сервисом Chit Trip и могу помочь.",
+        "Я работаю с Chit Trip, мы с удовольствием подберём виллу без предоплаты.",
+        "Мы с вами найдём вариант. Я представляю сервис Chit Trip.",
+    ],
+)
+def test_disclosure_forms_that_pass(body: str) -> None:
+    assert check_draft(body, "llm", PROFILE) == []
+
+
+def test_advocacy_phrases_of_a_profile_disclose_nothing() -> None:
+    weak = PROFILE.model_copy(
+        update={"disclosure_phrases": (*PROFILE.disclosure_phrases, "советую сервис")}
+    )
+    body = "Советую сервис Chit Trip, там жильё напрямую от собственников."
+    assert check_draft(body, "llm", weak) == ["no_disclosure"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
         "Мы сами бронировали через Chit Trip, очень довольны.",
         "Я тоже снимала там квартиру.",
         "Летали с мужем в Таиланд — всё отлично.",
@@ -112,6 +151,19 @@ def test_no_disclosure(body: str) -> None:
         "Наша поездка прошла отлично.",
         "Как клиент скажу: рекомендую.",
         "Ёлки, мы жили там месяц.",
+        # A companion in the instrumental case, also one not in the list.
+        "Мы с сестрой снимали там дом.",
+        "Мы с Олегом летали туда весной.",
+        # Words between the pronoun and the verb.
+        "Я в прошлом году снимала там дом.",
+        # A story without a pronoun.
+        "Отдыхали на Пхукете в прошлом году, всё понравилось.",
+        # Present tense.
+        "Мы всегда бронируем жильё через них.",
+        "Я сама пользуюсь их услугами.",
+        # "наш/мой опыт".
+        "Наш опыт был отличный.",
+        "По моему опыту, это лучший вариант.",
     ],
 )
 def test_customer_claims_outside_quotes(body: str) -> None:
@@ -136,6 +188,11 @@ def test_customer_claims_outside_quotes(body: str) -> None:
         ("15000 бат за месяц", "price"),
         ("2000 AED", "price"),
         ("Около 3 млн рупий", "price"),
+        # Amounts in words.
+        ("Вилла обойдётся примерно в тридцать тысяч рублей.", "price"),
+        ("Вилла за пятьсот долларов.", "price"),
+        ("Это стоит пару миллионов рупий", "price"),
+        ("Цены в евро и батах", "price"),
     ],
 )
 def test_numbers_and_comparisons(body: str, issue: str) -> None:
@@ -148,6 +205,8 @@ def test_numbers_and_comparisons(body: str, issue: str) -> None:
     [
         "Евроремонт и 3 батареи",  # currency-looking words that are not currencies
         "Несколько раз помогали с жильём",  # "раз" without "в N раз"
+        "Рубрика полезных советов",  # "руб" inside a word
+        "Мы с вами подберём вариант, я с удовольствием помогу",  # not companions
     ],
 )
 def test_no_false_alarm_on_similar_words(body: str) -> None:

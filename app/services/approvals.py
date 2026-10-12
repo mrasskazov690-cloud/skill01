@@ -27,7 +27,7 @@ from app.domain.states import (
 from app.services.audit import write_audit
 from app.services.claims import claim_message
 from app.services.guard import check_draft
-from app.services.outbox import enqueue_reply
+from app.services.outbox import PAUSED_SETTING, enqueue_reply
 from app.services.transitions import (
     change_message_status,
     change_message_status_if_allowed,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 NEEDS_APPROVAL = "needs_approval"
 REJECTED_BY_OWNER = "rejected_by_owner"
 AUTO_MODE = "auto_mode"
-PAUSED = "paused"
+PAUSED = PAUSED_SETTING
 STALE_APPROVAL = "stale_approval"
 _RELEASED = {"claimed_by": None, "lease_expires_at": None}
 

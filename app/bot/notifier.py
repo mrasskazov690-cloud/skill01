@@ -8,7 +8,7 @@ gets one card, and a new draft of the same lead (stale approval) gets a new one.
 import asyncio
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 
 from app.bot.handlers import Factory, send_card
 from app.bot.panel import drafts_without_card
@@ -30,13 +30,26 @@ class CardNotifier:
 
     async def send_new_cards(self) -> int:
         """One round: cards for pending drafts without one. Returns how many were sent.
-        A Telegram error ends the round; the drafts are tried again on the next one."""
+        A card Telegram refuses (e.g. too long) is replaced by a brief one, so it does
+        not hold up the drafts after it; an error for the whole chat (bot blocked, flood
+        wait, network) ends the round, and the drafts are tried again on the next one."""
         async with self.factory() as s:
             draft_ids = await drafts_without_card(s)
         sent = 0
         for draft_id in draft_ids:
             try:
-                if await send_card(self.bot, self.factory, self.owner_id, draft_id):
+                try:
+                    shown = await send_card(self.bot, self.factory, self.owner_id, draft_id)
+                except TelegramBadRequest as exc:
+                    # This card only: the brief card has no text that can be refused.
+                    # If Telegram refuses that too, the chat is the problem (below).
+                    self._log.warning(
+                        "bot_card_refused", draft_id=draft_id, error=type(exc).__name__
+                    )
+                    shown = await send_card(
+                        self.bot, self.factory, self.owner_id, draft_id, brief=True
+                    )
+                if shown:
                     sent += 1
             except TelegramRetryAfter as exc:
                 self._log.warning("bot_card_flood_wait", seconds=exc.retry_after)

@@ -3,9 +3,10 @@ discounts) or break the advertising rules go to the owner instead of being sent.
 False positives only cost a review.
 
 With the service profile the draft must also disclose the tie to the service (one of
-its disclosure phrases and its name, outside quotes) and may quote at most one review,
-word for word. Telling a customer's story as one's own ("мы сами бронировали",
-"летали с мужем") outside quotes is never allowed.
+its disclosure phrases, in the first person and not negated, tied to its name in one
+sentence, outside quotes) and may quote at most one review, word for word. Telling a
+customer's story as one's own ("мы сами бронировали", "летали с мужем") outside quotes
+is never allowed.
 """
 
 # ruff: noqa: RUF001, RUF002, RUF003  (the patterns are Russian text by design)
@@ -29,6 +30,12 @@ _PATTERNS: dict[str, re.Pattern[str]] = {
         r"|долл[а-я]*|евро(?![а-я])|бат(?:а|ов)?(?![а-я])|дирхам[а-я]*|рупи[а-я]*"
         r"|(?:usd|eur|aed|thb|idr|rub)(?![a-z]))"
         r"|[₽$€]\s*\d"
+        # Amounts in words ("тридцать тысяч рублей", "пятьсот долларов"): a currency or
+        # a "thousand/million" never belongs in a draft, with or without a digit.
+        r"|[₽$€]|(?<![а-я])(?:руб(?:\.|л[а-я]*)?|доллар[а-я]*|евро|бат(?:а|ов|ы)?"
+        r"|дирхам[а-я]*|рупи[а-я]*|тысяч[а-я]*|тыс\.|млн|млрд|миллион[а-я]*"
+        r"|миллиард[а-я]*)(?![а-я-])"
+        r"|(?<![a-z])(?:usd|eur|aed|thb|idr|rub)(?![a-z])"
     ),
     "address": re.compile(
         r"(?<![а-я])(?:"
@@ -59,22 +66,44 @@ _PATTERNS: dict[str, re.Pattern[str]] = {
 _QUOTES = re.compile(r"«([^»]*)»|“([^”]*)”|„([^“”]*)[“”]|\"([^\"]*)\"")
 _ELLIPSIS = re.compile(r"^(?:\.\.\.|…)\s*|\s*(?:\.\.\.|…)$")
 _SPACES = re.compile(r"\s+")
-# Past-tense first-person stories of a customer: "мы бронировали", "я сама снимала".
+# First-person stories of a customer: "мы бронировали", "я в прошлом году снимала",
+# "мы всегда бронируем", "мы с сестрой", "отдыхали на Пхукете", "наш опыт".
 _CLIENT_VERBS = (
     r"(?:за)?бронир|снима|сня|арендова|(?:с)?лета|(?:съ)?езди|(?:про)?жи|останавлива"
     r"|останови|отдыха|покупа|купи|бра|взя|заказ|(?:вос)?пользова|обраща|обрати|оформ"
 )
+_CLIENT_PAST = rf"(?:{_CLIENT_VERBS})[а-я]*?(?:л|ла|ли|ло)(?:сь)?(?![а-я])"
+_CLIENT_PRESENT = (
+    r"(?:(?:за)?бронирую|(?:за)?бронируем|снимаю|снимаем|арендую|арендуем|пользуюсь"
+    r"|пользуемся|летаю|летаем|езжу|ездим|отдыхаю|отдыхаем|заказываю|заказываем"
+    r"|обращаюсь|обращаемся|останавливаюсь|останавливаемся|покупаю|покупаем)(?![а-я])"
+)
+# "мы с вами", "я с удовольствием": not a companion.
+_NOT_COMPANIONS = r"вами|тобой|удовольствием|радостью|интересом|нетерпением|пониманием|уважением"
 _CUSTOMER_CLAIM = re.compile(
-    r"(?<![а-я])(?:я|мы|сам|сама|сами)\s+"
-    r"(?:(?:сам|сама|сами|уже|тоже|недавно|там|лично|не раз|неоднократно|как-то)\s+){0,3}"
-    rf"(?:{_CLIENT_VERBS})[а-я]*?(?:л|ла|ли|ло)(?:сь)?(?![а-я])"
+    # A pronoun, up to four words, a client verb in the past or present tense.
+    r"(?<![а-я])(?:я|мы|сам|сама|сами)\s+(?:[а-я-]+\s+){0,4}?"
+    rf"(?:{_CLIENT_PAST}|{_CLIENT_PRESENT})"
+    # A sentence that starts with a client verb: "Отдыхали на Пхукете…".
+    rf"|(?:^|[.!?…]\s+|\n\s*)(?:(?:тоже|уже|сами|сама|сам|недавно|как-то)\s+)?"
+    rf"{_CLIENT_PAST}"
     r"|(?<![а-я])(?:с|вместе с)\s+(?:мужем|женой|супругом|супругой|семьей|детьми|ребенком"
-    r"|подругой|другом|парнем|девушкой|мамой|родителями)(?![а-я])"
+    r"|подругой|подругами|другом|друзьями|парнем|девушкой|мамой|папой|родителями"
+    r"|сестрой|братом|сыном|дочкой|дочерью|коллегой|коллегами)(?![а-я])"
+    # "мы с <anyone>" (instrumental case): a companion.
+    rf"|(?<![а-я])(?:я|мы)\s+с\s+(?!(?:{_NOT_COMPANIONS})(?![а-я]))"
+    r"[а-я]+(?:ой|ей|ом|ем|ами|ями|ым|им)(?![а-я])"
     r"|(?<![а-я])(?:мне|нам)\s+(?:(?:тоже|уже|там|быстро|очень)\s+)?"
     r"(?:помог|подобрал|нашл|нашел|забронировал|оформил|посоветовал|сдал)[а-я]*"
-    r"|(?<![а-я])(?:наш|наша|нашу|нашей|мой|моя|мою|моей)\s+(?:отпуск|поездк|отдых|семь)"
+    r"|(?<![а-я])(?:наш|наша|нашу|нашей|нашему|нашим|мой|моя|мою|моей|моему|моим)\s+"
+    r"(?:отпуск|поездк|отдых|семь|опыт)"
     r"|(?<![а-я])как\s+(?:клиент|покупател)"
 )
+# Sentences: a dot that ends one is followed by a space ("chittrip.ru" is one word).
+_SENTENCE_END = re.compile(r"[.!?…]+(?=\s|$)|\n")
+_WORD = r"[^\s.,:;!?…—–()-]+"
+# A disclosure must not be negated: "я не сотрудничаю", "никогда не работаю с".
+_NEGATION = re.compile(r"(?<![а-яa-z])(?:не|ни|никогда|нигде)\s+(?:[а-я]+\s+)?$")
 
 
 def check_draft(
@@ -91,11 +120,11 @@ def check_draft(
         return []
     text = _fold(body)
     issues = [code for code, pattern in _PATTERNS.items() if pattern.search(text)]
-    quotes, outside = _split_quotes(body)
+    _, outside = _split_quotes(body)
     if _CUSTOMER_CLAIM.search(_fold(outside)):
         issues.append("customer_claim")
     if profile is not None:
-        issues.extend(_profile_issues(quotes, outside, profile))
+        issues.extend(_profile_issues(body, profile))
     if len(body) > MAX_DRAFT_LENGTH:
         issues.append("too_long")
     return issues
@@ -105,26 +134,30 @@ def _fold(text: str) -> str:
     return text.lower().replace("ё", "е")
 
 
-def _split_quotes(body: str) -> tuple[list[str], str]:
-    """The quoted segments and the text outside them."""
-    quotes = [next(g for g in m.groups() if g is not None) for m in _QUOTES.finditer(body)]
-    return quotes, _QUOTES.sub(" ", body)
+def _split_quotes(body: str, names: frozenset[str] = frozenset()) -> tuple[list[str], str]:
+    """The quoted segments and the text outside them. A quoted name ("сервис
+    «Chit Trip»") is a name, not a quote: it stays in the text, without the marks."""
+    quotes: list[str] = []
+
+    def outside(match: re.Match[str]) -> str:
+        quote = next(g for g in match.groups() if g is not None)
+        if _fold(_normalize(quote)) in names:
+            return quote
+        quotes.append(quote)
+        return " "
+
+    return quotes, _QUOTES.sub(outside, body)
 
 
 def _normalize(text: str) -> str:
     return _SPACES.sub(" ", text).strip()
 
 
-def _profile_issues(quotes: list[str], outside: str, profile: "ServiceProfile") -> list[str]:
+def _profile_issues(body: str, profile: "ServiceProfile") -> list[str]:
     issues: list[str] = []
-    folded = _fold(outside)
-    names = {_fold(name) for name in profile.names}
-    # A quoted name ("сервис «Chit Trip»") is a name, not a review.
-    quoted_names = [q for q in quotes if _fold(_normalize(q)) in names]
-    cited = [q for q in quotes if _fold(_normalize(q)) not in names]
-    discloses = any(_fold(p) in folded for p in profile.disclosure_phrases)
-    named = bool(quoted_names) or any(name in folded for name in names)
-    if not (discloses and named):
+    names = frozenset(_fold(name) for name in profile.names)
+    cited, outside = _split_quotes(body, names)
+    if not _discloses(_fold(outside), names, profile.disclosures):
         issues.append("no_disclosure")
     if len(cited) > 1:
         issues.append("too_many_quotes")
@@ -135,3 +168,29 @@ def _profile_issues(quotes: list[str], outside: str, profile: "ServiceProfile") 
             issues.append("misquote")
             break
     return issues
+
+
+def _discloses(text: str, names: frozenset[str], phrases: tuple[str, ...]) -> bool:
+    """A first-person, not negated disclosure phrase tied to the service's name in one
+    sentence: "работаю с Chit Trip", "сотрудничаю с сервисом Chit Trip" (the name at
+    most three words after the phrase) or "сервис Chit Trip, с которым сотрудничаю"
+    (the name before it, joined by "который"/"где")."""
+    name_re = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    for sentence in _SENTENCE_END.split(_SPACES.sub(" ", text)):
+        for phrase in phrases:
+            phrase_re = re.escape(_fold(_normalize(phrase))).replace(r"\ ", r"\s+")
+            for match in re.finditer(rf"(?<![а-яa-z0-9]){phrase_re}(?![а-яa-z0-9])", sentence):
+                if _NEGATION.search(sentence[: match.start()]):
+                    continue
+                after = sentence[match.end() :]
+                before = sentence[: match.start()]
+                if re.match(
+                    rf"[\s,:—–-]*(?:{_WORD}[\s,:—–-]+){{0,3}}?(?:{name_re})(?![а-яa-z0-9])",
+                    after,
+                ) or re.search(
+                    rf"(?<![а-яa-z0-9])(?:{name_re})[\s,:—–-]+(?:{_WORD}\s+){{0,2}}"
+                    r"(?:котор[а-я]*|где)\s+(?:я\s+)?(?:сам[а-я]?\s+|лично\s+)?$",
+                    before,
+                ):
+                    return True
+    return False
