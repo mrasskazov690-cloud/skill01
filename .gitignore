@@ -4,3 +4,15 @@
 *.session-journal
 __pycache__/
 .venv/
+*.session*
+.env.*
+!.env.example
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
