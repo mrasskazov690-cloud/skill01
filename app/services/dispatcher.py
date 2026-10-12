@@ -3,22 +3,14 @@
 Lock order everywhere: conversation -> message -> account. Conversations and
 accounts are taken with SKIP LOCKED, so concurrent dispatchers never wait on
 each other; a skipped row counts as "busy" and is retried by dispatch_batch.
+An account is locked only when something about it can race: its round-robin
+position (last_assigned_at) or its max_active load.
 """
 
 import asyncio
 from typing import NamedTuple
 
-from sqlalchemy import (
-    ColumnElement,
-    and_,
-    exists,
-    func,
-    insert,
-    or_,
-    select,
-    true,
-    update,
-)
+from sqlalchemy import ColumnElement, and_, exists, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -76,12 +68,10 @@ _CANDIDATES = (
     .order_by(Message.received_at, Message.id)
 )
 
-_ROUND_ROBIN = (
-    select(Account.id)
+_ROUND_ROBIN_ORDER = (
+    select(Account.id, Account.last_assigned_at)
     .where(ELIGIBLE)
     .order_by(Account.last_assigned_at.asc().nulls_first(), Account.id)
-    .limit(1)
-    .with_for_update(skip_locked=True)
 )
 
 
@@ -134,7 +124,7 @@ async def dispatch_batch(
 async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> _Pass:
     limit = candidate_limit or get_settings().DISPATCH_CANDIDATE_LIMIT
     candidates = (await session.execute(_CANDIDATES.limit(limit))).all()
-    busy = held = False
+    busy = held = operators_busy = False
     skipped: set[int] = set()
     for message_id, conversation_id in candidates:
         if conversation_id in skipped:
@@ -158,7 +148,7 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
 
         pinned = conversation.operator_account_id
         if pinned is not None:
-            locked = await _lock_operator(session, pinned)
+            locked = await _reserve_pinned_operator(session, pinned)
             if locked is None:
                 busy = True
             elif locked:
@@ -170,6 +160,10 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
             skipped.add(conversation_id)
             continue
 
+        if operators_busy:  # all eligible operators were locked a moment ago; next pass
+            busy = True
+            skipped.add(conversation_id)
+            continue
         account_id, operators_busy = await _lock_round_robin(session)
         if account_id is not None:
             await _assign(
@@ -181,6 +175,22 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
         busy = True
         skipped.add(conversation_id)
     return _Pass(None, busy, held)
+
+
+async def _reserve_pinned_operator(session: AsyncSession, account_id: int) -> bool | None:
+    """True: assign to it; False: not eligible; None: locked by another transaction."""
+    account = (
+        await session.execute(
+            select(Account.max_active, ELIGIBLE.label("eligible")).where(Account.id == account_id)
+        )
+    ).one()
+    if not account.eligible:
+        return False
+    if account.max_active is None:
+        # No load limit to protect and the round-robin position does not change, so no
+        # lock: holding it would make concurrent round-robin picks skip this operator.
+        return True
+    return await _lock_operator(session, account_id)
 
 
 async def _lock_operator(session: AsyncSession, account_id: int) -> bool | None:
@@ -209,22 +219,26 @@ async def _lock_round_robin(session: AsyncSession) -> tuple[int | None, bool]:
     Returns (account_id, False) on success, (None, True) when eligible operators exist
     but all are locked by other transactions, (None, False) when none is eligible.
     """
-    excluded: list[int] = []
-    while True:
+    # Not one `ORDER BY ... LIMIT 1 FOR UPDATE SKIP LOCKED`: under READ COMMITTED that
+    # sorts by the statement snapshot and may lock a row whose last_assigned_at was
+    # just moved by a concurrent commit, giving one operator two turns in a row.
+    # Instead walk the order and lock a row only if its position is still the one seen.
+    order = (await session.execute(_ROUND_ROBIN_ORDER)).all()
+    busy = False
+    for account_id, seen in order:
         savepoint = await session.begin_nested()
-        account_id = await session.scalar(
-            _ROUND_ROBIN.where(Account.id.not_in(excluded)) if excluded else _ROUND_ROBIN
+        locked = await session.scalar(
+            select(Account.id)
+            .where(Account.id == account_id, Account.last_assigned_at.is_not_distinct_from(seen))
+            .with_for_update(skip_locked=True)
         )
-        if account_id is not None and await is_eligible(session, account_id):
+        # Fresh statement under the lock: sees assignments committed meanwhile (max_active).
+        if locked is not None and await is_eligible(session, account_id):
             await savepoint.commit()
             return account_id, False
         await savepoint.rollback()
-        if account_id is None:
-            remaining = exists().where(
-                ELIGIBLE, Account.id.not_in(excluded) if excluded else true()
-            )
-            return None, bool(await session.scalar(select(remaining)))
-        excluded.append(account_id)  # reached max_active since the locking SELECT's snapshot
+        busy |= locked is None  # in use by another dispatcher, or just took a turn
+    return None, busy
 
 
 async def _assign(

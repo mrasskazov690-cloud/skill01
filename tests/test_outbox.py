@@ -191,9 +191,10 @@ async def test_resolve_uncertain_as_not_sent_allows_a_new_send(
 
 
 async def test_flood_wait_requeues_and_pauses_the_account(
-    session_factory: Factory, work: tuple[int, int], main_id: int
+    session_factory: Factory, work: tuple[int, int], main_id: int, make_account
 ) -> None:
     message_id, operator_id = work
+    spare = (await make_account()).id
     outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
     adapter = FakeTelegramAccount(operator_id, [FloodWait(30)])
 
@@ -213,7 +214,7 @@ async def test_flood_wait_requeues_and_pauses_the_account(
     assert len(adapter.calls) == 1
     other = await new_message(session_factory, main_id, client=2)
     assert await dispatch_all(session_factory) == [other]
-    assert (await get(session_factory, Message, other)).operator_account_id != operator_id
+    assert (await get(session_factory, Message, other)).operator_account_id == spare
 
     due = row.not_before + timedelta(seconds=1)
     assert await _send(session_factory, outbox_id, adapter, now=due) == "sent"
@@ -264,11 +265,10 @@ async def test_flood_wait_attempt_limit_goes_to_review(
 
 
 async def test_peer_flood_restricts_the_account_and_never_reroutes(
-    session_factory: Factory, main_id: int, make_account
+    session_factory: Factory, work: tuple[int, int], main_id: int, make_account
 ) -> None:
+    message_id, operator_id = work
     other_operator = (await make_account()).id
-    message_id, operator_id = await processing_message(session_factory, main_id, client=1)
-    assert operator_id != other_operator
     outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
     adapter = FakeTelegramAccount(operator_id, [PeerFlood])
     other_adapter = FakeTelegramAccount(other_operator)
@@ -354,26 +354,26 @@ async def test_parallel_enqueue_creates_one_live_send(
     assert all(isinstance(r, SendInFlight) for r in same)  # default key is new, row is live
     assert await count_rows(session_factory, Outbox) == 1
     assert await count_rows(session_factory, AuditLog, AuditLog.action == "reply_enqueued") == 1
-    same_key = await asyncio.gather(*(enqueue("k-shared") for _ in range(10)))
-    assert len({r for r in same_key if isinstance(r, int)}) <= 1
 
 
 async def test_same_key_returns_the_existing_row(
     session_factory: Factory, work: tuple[int, int]
 ) -> None:
     message_id, operator_id = work
-    first = await queued_reply(session_factory, message_id, operator_id)
-    again = await asyncio.gather(
+    concurrent = await asyncio.gather(
         *(queued_reply(session_factory, message_id, operator_id) for _ in range(10))
     )
+    later = await queued_reply(session_factory, message_id, operator_id)
 
-    assert {row.id for row in again} == {first.id}
+    assert {row.id for row in concurrent} == {later.id}
     assert await count_rows(session_factory, Outbox) == 1
 
 
-async def test_enqueue_preconditions(session_factory: Factory, main_id: int, make_account) -> None:
+async def test_enqueue_preconditions(
+    session_factory: Factory, work: tuple[int, int], main_id: int, make_account
+) -> None:
+    message_id, operator_id = work
     other = (await make_account()).id
-    message_id, operator_id = await processing_message(session_factory, main_id, client=1)
     assigned_only = await new_message(session_factory, main_id, client=2)
     await dispatch_all(session_factory)
     assert (await get(session_factory, Message, assigned_only)).operator_account_id == other

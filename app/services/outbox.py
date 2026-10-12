@@ -93,7 +93,7 @@ async def enqueue_reply(
         raise SendInFlight(f"message {message_id} already has live outbox row {live}")
     if message.status != MessageStatus.PROCESSING:
         raise WrongState(f"message {message_id} is {message.status}, not processing")
-    # ON CONFLICT also covers uq_outbox_live_message, the database-level guarantee.
+    # uq_outbox_live_message remains the database-level guarantee behind the check above.
     outbox_id = await session.scalar(
         pg_insert(Outbox)
         .values(
@@ -110,6 +110,8 @@ async def enqueue_reply(
         .returning(Outbox.id)
     )
     if outbox_id is None:
+        # This message's rows are written under its lock, so only another message's
+        # concurrent insert of the same key can conflict here.
         raise IdempotencyConflict("idempotency key was taken concurrently by another message")
     await write_audit(
         session,

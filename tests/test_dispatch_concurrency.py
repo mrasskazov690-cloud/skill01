@@ -67,7 +67,10 @@ async def test_parallel_dispatchers_assign_every_message_exactly_once(
     assert len({a.message_id for a in assignments}) == 200
     assert Counter(a.reason for a in assignments) == {"auto_round_robin": 50, "pinned": 150}
     by_message = {m.id: m.operator_account_id for m in messages}
-    assert all(a.to_account_id == by_message[a.message_id] for a in assignments)
+    assert all(
+        a.message_id is not None and a.to_account_id == by_message[a.message_id]
+        for a in assignments
+    )
     async with session_factory() as s:
         audited = await s.scalar(
             select(func.count(func.distinct(AuditLog.entity_id))).where(
@@ -76,8 +79,9 @@ async def test_parallel_dispatchers_assign_every_message_exactly_once(
         )
     assert audited == 200
 
-    # Round-robin: 50 new conversations over 3 operators is 17/17/16 when serial;
-    # concurrency may shift a few, never starve an operator.
+    # Round-robin: 50 new conversations over 3 operators is 17/17/16 when serial. Under
+    # SKIP LOCKED an operator whose row is in use loses that turn to the next one, so a
+    # small spread is expected (stress runs: almost always 1, at most 3); never starvation.
     load = Counter(conversations.values())
     assert max(load.values()) - min(load.values()) <= 4, load
 

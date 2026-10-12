@@ -66,8 +66,14 @@ app/
                       assignments, templates, settings, outbox, audit_log
   db/session.py       create_engine(), create_sessionmaker(), transaction()
   domain/states.py    статусы и таблица разрешённых переходов (ensure_transition)
-  domain/errors.py    базовая доменная ошибка
+  domain/errors.py    доменные ошибки (ConversationBusy, SendInFlight, NotOwner и др.)
   services/ingest.py  ingest_message(): идемпотентный приём сообщения
+  services/dispatcher.py   dispatch_one(), dispatch_batch(): закрепление и round-robin
+  services/assignments.py  assign_manual(), reassign_conversation(): ручное переназначение
+  services/claims.py  claim_message(), release(), recover_stale(): аренда сообщений в работе
+  services/outbox.py  enqueue_reply(), execute_send(), resolve_uncertain(),
+                      recover_interrupted_sends(), expire_flood_waits()
+  services/transitions.py  смена статусов: проверка по таблице переходов + audit_log
   services/audit.py   write_audit(): запись в audit_log
   telegram/base.py    протокол TelegramAccount и ошибки адаптера
   telegram/fake.py    FakeTelegramAccount: сценарий исходов, запись отправленного
@@ -81,6 +87,14 @@ tests/                pytest на реальном PostgreSQL
 - `conversations.client_id UNIQUE`: у клиента один диалог, и диалог закрепляется за оператором.
 - `outbox`: частичный уникальный индекс по `message_id` для статусов `queued`, `sending`, `sent`, `uncertain`. На одно сообщение возможна не больше чем одна живая отправка.
 - Статусы хранятся как `text` с `CHECK`. Список значений зафиксирован в миграции, поэтому его изменение требует новой ревизии.
+
+## Назначение и отправка
+
+- Блокировки везде берутся в одном порядке: диалог → сообщение → outbox → аккаунт. Диалог диспетчер берёт через `FOR UPDATE SKIP LOCKED`. Так же он берёт аккаунт оператора при выборе по round-robin и при заданном `max_active`. Поэтому параллельные диспетчеры не ждут друг друга.
+- Диалог закрепляется за первым оператором. Следующие сообщения клиента идут тому же оператору. Если он недоступен, сообщения остаются `pending` с `review_reason='pinned_operator_unavailable'`. Автоматического переназначения нет. Диалог переносят вручную через `assign_manual()` или `reassign_conversation()`.
+- Новый диалог получает допустимый оператор с самым давним `last_assigned_at`. Допустимый оператор: `kind='operator'`, включён, на смене, `state='active'`, нет активного flood wait, нагрузка меньше `max_active`.
+- `execute_send()` фиксирует `sending` до вызова API и вызывает адаптер вне транзакции. Тайм-аут переводит отправку в `uncertain`, а сообщение на ручную проверку (`resolve_uncertain()`). Автоповтора нет. FLOOD_WAIT возвращает отправку в очередь с `not_before`. После `DISPATCH_MAX_SEND_ATTEMPTS` попыток отправка уходит на проверку. PEER_FLOOD ставит аккаунт в `restricted`. Ответ на другой аккаунт не перебрасывается.
+- При старте процесса до запуска воркеров вызовите `recover_interrupted_sends()`: строки, оставшиеся в `sending`, станут `uncertain`. Периодически вызывайте `recover_stale()` и `expire_flood_waits()`.
 
 ## Безопасность
 
