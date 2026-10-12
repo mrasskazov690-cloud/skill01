@@ -16,3 +16,4 @@ dist/
 .ruff_cache/
 .coverage
 htmlcov/
+profile.local.yaml
