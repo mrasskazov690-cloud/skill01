@@ -10,9 +10,11 @@ Nothing here logs or audits client text, reply bodies or sessions.
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import literal as sa_literal
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -27,7 +29,12 @@ from app.domain.states import (
     SendStatus,
 )
 from app.logging import get_logger
-from app.services.approvals import create_draft, is_auto_mode, is_paused
+from app.services.approvals import (
+    create_draft,
+    expire_stale_approvals,
+    is_auto_mode,
+    is_paused,
+)
 from app.services.audit import write_audit
 from app.services.claims import claim_message
 from app.services.dispatcher import CAN_SEND, dispatch_one
@@ -35,6 +42,7 @@ from app.services.guard import check_draft
 from app.services.ingest import ClientRef, ingest_message
 from app.services.leads import classify_duplicate
 from app.services.outbox import (
+    cancel_queued_send,
     enqueue_reply,
     error_code,
     execute_send,
@@ -47,19 +55,30 @@ from app.telegram.base import (
     AuthorUnavailable,
     FloodWait,
     PrivacyRestricted,
+    ReactionInvalid,
     TelegramAccount,
     TelegramError,
     WorkChatMessage,
 )
 from app.telegram.links import pick_lead_link
 from app.worker.clock import Clock, SystemClock
-from app.worker.drafts import DraftProvider, TemplateDraftProvider
+from app.worker.drafts import (
+    DraftProvider,
+    DraftUnavailable,
+    NoDraft,
+    Reply,
+    TemplateDraftProvider,
+)
 from app.worker.lock import SenderLock
+
+if TYPE_CHECKING:
+    from app.drafts.profile import ServiceProfile
 
 HEART = "❤️"
 BLOCKED = "🚫"
-# Leads people already handled by hand carry one of these; they are never taken.
-HANDLED_REACTIONS = frozenset({HEART, BLOCKED})
+# Used for a privacy refusal when the work chat does not allow REACTION_PRIVACY.
+PRIVACY_FALLBACK = "👎"
+HANDLED_MANUALLY = "handled_manually"
 NO_LINK = "no_link"
 NO_TEMPLATE = "no_template"
 DIALOG_CHECK_FAILED = "dialog_check_failed"
@@ -79,6 +98,11 @@ INTAKE_FAILED = "intake_failed"
 LEADS_PER_TICK = 20
 _RELEASED = {"claimed_by": None, "lease_expires_at": None}
 _PRIVACY_CODE = error_code(PrivacyRestricted())  # outbox.error of a privacy refusal
+# messages.meta key for what the draft provider made of a lead (country, need...).
+DRAFT_INFO_KEY = "draft_info"
+# The lead was not drafted because it no longer needs a reply (taken, duplicate): the
+# locked step below decides what happens to it.
+_SKIP = object()
 
 TickKind = Literal["locked_out", "paused", "idle", "sent", "draft", "deferred"]
 
@@ -108,12 +132,14 @@ class Worker:
         *,
         clock: Clock | None = None,
         drafts: DraftProvider | None = None,
+        profile: "ServiceProfile | None" = None,
         name: str = "sender",
     ) -> None:
         self.factory = session_factory
         self.adapters = dict(adapters)
         self.clock = clock or SystemClock()
         self.drafts = drafts or TemplateDraftProvider()
+        self.profile = profile  # the guard checks disclosure and quotes against it
         self.name = name
         self.lock = SenderLock(engine)
         self._warned_locked_out = False
@@ -138,8 +164,10 @@ class Worker:
         while max_polls is None or polls < max_polls:
             try:
                 await self.poll_work_chat()
-            except Exception:
-                self._log.exception("intake_poll_failed")
+            except Exception as exc:
+                # Error code and place only: an exception's text (or a traceback that
+                # renders it) may carry the client's message.
+                self._log.error("intake_poll_failed", error=error_code(exc), where=_origin(exc))
             polls += 1
             await self.clock.sleep(get_settings().WORK_CHAT_POLL_SECONDS)
 
@@ -207,7 +235,7 @@ class Worker:
         return taken
 
     async def _store(self, reader: TelegramAccount, message: WorkChatMessage) -> bool | None:
-        if message.reactions & HANDLED_REACTIONS:
+        if message.reactions & handled_reactions():
             async with transaction(self.factory) as s:
                 await self._save_cursor(s, message.chat_id, message.message_id)
             return False
@@ -231,6 +259,7 @@ class Worker:
                         tg_user_id=author.tg_user_id,
                         username=author.username,
                         display_name=author.display_name,
+                        username_known=author.username_known,
                     )
                     reason = None
                 break
@@ -347,6 +376,7 @@ class Worker:
             if await is_paused(s):
                 return TickResult("paused")
             await expire_flood_waits(s)
+            await expire_stale_approvals(s, actor=f"worker:{self.name}")
         queued = await self._send_queued()
         if queued is not None:
             return queued
@@ -395,6 +425,11 @@ class Worker:
                 )
             ).all()
         for outbox_id, account_id in rows:
+            check = await self._recheck_lead(outbox_id, self.adapters[account_id])
+            if check == "handled":
+                continue
+            if check == "deferred":
+                return TickResult("deferred", None, account_id)
             status = await execute_send(self.factory, outbox_id, self.adapters[account_id])
             if status is not None:
                 message_id = await self._after_send(outbox_id, status, self.adapters[account_id])
@@ -470,6 +505,18 @@ class Worker:
                     )
                 return None
 
+        # The draft is made before the locks below are taken: a Claude call takes
+        # seconds, and nothing should wait on this lead's rows meanwhile.
+        reply: Reply | NoDraft | object | None = _SKIP
+        if not has_dialog:
+            try:
+                reply = await self._make_draft(lead)
+            except DraftUnavailable as exc:
+                # Rate limit, server error, network: the lead stays assigned and is
+                # tried again on the next tick.
+                self._log.warning("draft_unavailable", message_id=lead.message_id, error=exc.code)
+                return TickResult("deferred", lead.message_id, lead.account_id)
+
         outbox_id: int | None = None
         async with transaction(self.factory) as s:
             # Lock order: conversation -> message (claim, draft and outbox follow).
@@ -502,9 +549,25 @@ class Worker:
             if duplicate is not None:
                 await self._close_lead(s, lead, MessageStatus.CANCELLED, duplicate)
                 return None
+            if reply is _SKIP:
+                # It looked taken or a duplicate a moment ago and no longer does: the
+                # next tick drafts it.
+                return None
             await claim_message(s, lead.message_id, lead.account_id, self.name)
-            reply = await self.drafts.draft(s, lead.message_id)
-            if reply is None:
+            if isinstance(reply, NoDraft):
+                await self._save_draft_info(s, lead.message_id, reply.info)
+                await change_message_status(
+                    s,
+                    lead.message_id,
+                    MessageStatus.PROCESSING,
+                    MessageStatus.AWAITING_REVIEW,
+                    actor=f"worker:{self.name}",
+                    action="lead_not_drafted",
+                    values={"review_reason": reply.reason, **_RELEASED},
+                    details={"reason": reply.reason, "error": reply.error},
+                )
+                return None
+            if not isinstance(reply, Reply):
                 await change_message_status(
                     s,
                     lead.message_id,
@@ -515,7 +578,8 @@ class Worker:
                     values={"review_reason": NO_TEMPLATE, **_RELEASED},
                 )
                 return None
-            issues = check_draft(reply.body, reply.source)
+            await self._save_draft_info(s, lead.message_id, reply.info)
+            issues = check_draft(reply.body, reply.source, self.profile)
             if issues or not await is_auto_mode(s):
                 await create_draft(
                     s,
@@ -541,11 +605,50 @@ class Worker:
                 idempotency_key=f"auto:{lead.message_id}:{attempts}",
             )
             outbox_id = outbox.id
+        check = await self._recheck_lead(outbox_id, adapter)
+        if check == "handled":
+            return None
+        if check == "deferred":  # the reply stays queued for the next tick
+            return TickResult("deferred", lead.message_id, lead.account_id)
         status = await execute_send(self.factory, outbox_id, adapter)
         if status is None:
             return TickResult("deferred", lead.message_id, lead.account_id)
         await self._after_send(outbox_id, status, adapter)
         return TickResult("sent", lead.message_id, lead.account_id, status)
+
+    async def _make_draft(self, lead: _Lead) -> Reply | NoDraft | object | None:
+        """The provider's answer for a lead that still needs one, else _SKIP."""
+        async with transaction(self.factory) as s:
+            current = (
+                await s.execute(
+                    select(Message.status, Message.operator_account_id).where(
+                        Message.id == lead.message_id
+                    )
+                )
+            ).one()
+            if current.status != MessageStatus.ASSIGNED or (
+                current.operator_account_id != lead.account_id
+            ):
+                return _SKIP
+            # Checked again under the locks; here it only saves a Claude call.
+            if await classify_duplicate(
+                s, lead.client_id, lead.text_hash, message_id=lead.message_id
+            ):
+                return _SKIP
+            return await self.drafts.draft(s, lead.message_id)
+
+    async def _save_draft_info(
+        self, session: AsyncSession, message_id: int, info: Mapping[str, Any]
+    ) -> None:
+        if not info:
+            return
+        await session.execute(
+            update(Message)
+            .where(Message.id == message_id)
+            .values(
+                meta=Message.meta.op("||")(sa_literal({DRAFT_INFO_KEY: dict(info)}, type_=JSONB))
+            )
+        )
 
     async def _close_lead(
         self,
@@ -571,11 +674,59 @@ class Worker:
             details={"reason": reason, "account_id": lead.account_id, "error": error},
         )
 
+    async def _recheck_lead(
+        self, outbox_id: int, adapter: TelegramAccount
+    ) -> Literal["send", "handled", "deferred"]:
+        """Re-read the lead's reactions right before its reply goes out: if people have
+        handled it by hand meanwhile (❤️/🚫), the reply is withdrawn and the lead is
+        cancelled('handled_manually'). A flood wait on the read defers the send; any
+        other read failure (e.g. the lead was deleted) is audited and the send goes on."""
+        async with self.factory() as s:
+            row = (
+                await s.execute(
+                    select(
+                        Outbox.message_id, Message.source, Message.tg_chat_id, Message.tg_message_id
+                    )
+                    .join(Message, Message.id == Outbox.message_id)
+                    .where(Outbox.id == outbox_id)
+                )
+            ).one()
+        if row.source != MessageSource.WORK_CHAT:
+            return "send"
+        # The reader account reads the work chat; the sender reacts there, so it can too.
+        reader = self.adapters.get(get_settings().READER_ACCOUNT_ID or 0, adapter)
+        try:
+            reactions = await reader.fetch_reactions(row.tg_chat_id, row.tg_message_id)
+        except FloodWait:
+            return "deferred"
+        except Exception as exc:
+            self._log.warning(
+                "reaction_check_failed", message_id=row.message_id, error=error_code(exc)
+            )
+            async with transaction(self.factory) as s:
+                await write_audit(
+                    s,
+                    f"worker:{self.name}",
+                    "reaction_check_failed",
+                    "message",
+                    row.message_id,
+                    {"outbox_id": outbox_id, "error": error_code(exc)},
+                )
+            return "send"
+        if not reactions & handled_reactions():
+            return "send"
+        async with transaction(self.factory) as s:
+            await cancel_queued_send(
+                s, outbox_id, reason=HANDLED_MANUALLY, actor=f"worker:{self.name}"
+            )
+        return "handled"
+
     async def _after_send(
         self, outbox_id: int, status: SendStatus, adapter: TelegramAccount
     ) -> int:
-        """❤️ on the lead after a send, 🚫 when the user's privacy blocks us, else none.
-        A failed reaction never changes the send's outcome; it is audited."""
+        """❤️ on the lead after a send, REACTION_PRIVACY (🚫) when the user's privacy
+        blocks us (👎 if the chat does not allow it), else none. A failed reaction never
+        changes the send's outcome; it is audited."""
         async with self.factory() as s:
             row = (
                 await s.execute(
@@ -593,14 +744,28 @@ class Worker:
         if status == SendStatus.SENT:
             emoji = HEART
         elif status == SendStatus.FAILED and row.error == _PRIVACY_CODE:
-            emoji = BLOCKED
+            emoji = get_settings().REACTION_PRIVACY
         else:
             return row.message_id
         if row.source != MessageSource.WORK_CHAT:
             return row.message_id
         details = {"emoji": emoji, "account_id": adapter.account_id, "outbox_id": outbox_id}
         try:
-            await adapter.react(row.tg_chat_id, row.tg_message_id, emoji)
+            try:
+                await adapter.react(row.tg_chat_id, row.tg_message_id, emoji)
+            except ReactionInvalid:
+                if emoji in (HEART, PRIVACY_FALLBACK):
+                    raise
+                self._log.warning(
+                    "reaction_invalid",
+                    message_id=row.message_id,
+                    emoji=emoji,
+                    fallback=PRIVACY_FALLBACK,
+                    detail="the work chat does not allow REACTION_PRIVACY",
+                )
+                emoji = PRIVACY_FALLBACK
+                details["emoji"] = emoji
+                await adapter.react(row.tg_chat_id, row.tg_message_id, emoji)
         except Exception as exc:
             self._log.warning("reaction_failed", message_id=row.message_id, error=error_code(exc))
             async with transaction(self.factory) as s:
@@ -624,3 +789,19 @@ class Worker:
                 s, f"worker:{self.name}", "reaction_set", "message", row.message_id, details
             )
         return row.message_id
+
+
+def handled_reactions() -> frozenset[str]:
+    """Reactions that mark a lead as handled by people (or by us): such a lead is never
+    taken at intake, and its queued reply is withdrawn before sending."""
+    return frozenset({HEART, BLOCKED, get_settings().REACTION_PRIVACY, PRIVACY_FALLBACK})
+
+
+def _origin(exc: BaseException) -> str | None:
+    """Where an exception was raised (module:line), without its text."""
+    tb = exc.__traceback__
+    if tb is None:
+        return None
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return f"{tb.tb_frame.f_globals.get('__name__', '?')}:{tb.tb_lineno}"

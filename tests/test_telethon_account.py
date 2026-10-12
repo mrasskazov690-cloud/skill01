@@ -28,12 +28,15 @@ from app.telegram.base import (
     PeerRef,
     PermanentSendError,
     PrivacyRestricted,
+    ReactionInvalid,
     ResolvedAuthor,
+    SendRefused,
     SendTimeout,
     SentMessage,
     SourceUnavailable,
     TelegramAccount,
     UserBlocked,
+    UserRestricted,
 )
 from app.telegram.links import LeadLink
 from app.telegram.telethon_account import TEST_DC, TelethonAccount, map_error
@@ -353,14 +356,48 @@ async def test_random_id_duplicate_is_a_delivered_duplicate(
     assert result == SentMessage(None, duplicate=True)
 
 
-async def test_unmapped_rpc_error_propagates_unchanged(
+@pytest.mark.parametrize(
+    "error",
+    [
+        rpc(403, "CHAT_WRITE_FORBIDDEN"),
+        rpc(400, "SOME_NEW_REFUSAL"),
+        rpc(401, "AUTH_KEY_UNREGISTERED"),
+        rpc(406, "SOMETHING_NOT_ACCEPTABLE"),
+    ],
+)
+async def test_unknown_definitive_refusal_is_a_permanent_failure(
+    account: TelethonAccount, client: SubstitutedClient, error: errors.RPCError
+) -> None:
+    # The server answered with a refusal: nothing was delivered, so the send is not
+    # uncertain (before: the raw error propagated and outbox marked it uncertain).
+    client.send_results = [error]
+    with pytest.raises(SendRefused) as exc:
+        await account.send_text(PeerRef(42, None, SOURCE), "секретный текст", random_id=1)
+    assert isinstance(exc.value, PermanentSendError)
+    assert exc.value.__cause__ is error
+    assert exc.value.rpc_error == error.message
+    assert "секретный" not in str(exc.value)
+
+
+async def test_unmapped_non_rpc_error_propagates_unchanged(
     account: TelethonAccount, client: SubstitutedClient
 ) -> None:
-    error = rpc(403, "CHAT_WRITE_FORBIDDEN")
+    error = RuntimeError("unexpected")
     client.send_results = [error]
-    with pytest.raises(errors.ChatWriteForbiddenError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         await account.send_text(PeerRef(42, None, SOURCE), "x", random_id=1)
     assert exc.value is error
+
+
+async def test_user_restricted_is_its_own_permanent_failure(
+    account: TelethonAccount, client: SubstitutedClient
+) -> None:
+    error = rpc(403, "USER_RESTRICTED")
+    assert isinstance(error, errors.UserRestrictedError)
+    client.send_results = [error]
+    with pytest.raises(UserRestricted) as exc:
+        await account.send_text(PeerRef(42, None, SOURCE), "x", random_id=1)
+    assert isinstance(exc.value, PermanentSendError)
 
 
 async def test_flood_wait_while_opening_the_source(
@@ -424,7 +461,10 @@ async def test_resolve_author_from_user_links(
     by_name = LeadLink(kind="user", username="ivan", url="t.me/ivan")
     assert (await account.resolve_author(by_name)).tg_user_id == 42
     by_id = LeadLink(kind="user", user_id=77, url="tg://user?id=77")
-    assert await account.resolve_author(by_id) == ResolvedAuthor(77, None, None)
+    # Not cached: the profile was not read, so "no username" is not known.
+    assert await account.resolve_author(by_id) == ResolvedAuthor(
+        77, None, None, username_known=False
+    )
     client.entities["nobody"] = rpc(400, "USERNAME_NOT_OCCUPIED")
     with pytest.raises(SourceUnavailable):
         await account.resolve_author(LeadLink(kind="user", username="nobody", url="t.me/nobody"))
@@ -506,6 +546,58 @@ async def test_react(account: TelethonAccount, client: SubstitutedClient) -> Non
     client.send_results = [rpc(420, "FLOOD_WAIT_3")]
     with pytest.raises(FloodWait):
         await account.react(-100500, 13, "❤️")
+
+
+async def test_react_invalid_reaction_is_mapped(
+    account: TelethonAccount, client: SubstitutedClient
+) -> None:
+    client.input_entities[-100500] = types.InputPeerChannel(channel_id=500, access_hash=1)
+    client.send_results = [rpc(400, "REACTION_INVALID", SendReactionRequest)]
+    with pytest.raises(ReactionInvalid):
+        await account.react(-100500, 11, "🚫")
+
+
+async def test_fetch_reactions_rereads_one_message(
+    account: TelethonAccount, client: SubstitutedClient
+) -> None:
+    chat = types.InputPeerChannel(channel_id=500, access_hash=1)
+    client.input_entities[-100500] = chat
+    client.messages[(500, 11)] = tg_message(11, reactions=["❤"])
+    client.messages[(500, 12)] = tg_message(12)
+    assert await account.fetch_reactions(-100500, 11) == {"❤️"}
+    assert await account.fetch_reactions(-100500, 12) == set()
+    with pytest.raises(SourceUnavailable):  # deleted
+        await account.fetch_reactions(-100500, 13)
+    client.messages[(500, 14)] = rpc(420, "FLOOD_WAIT_9")
+    with pytest.raises(FloodWait):
+        await account.fetch_reactions(-100500, 14)
+
+
+@pytest.mark.parametrize(
+    ("user", "username", "known"),
+    [
+        (types.User(id=42, access_hash=1, first_name="Иван"), None, True),
+        (
+            types.User(
+                id=42,
+                access_hash=1,
+                usernames=[
+                    types.Username(username="old", active=False),
+                    types.Username(username="collectible", active=True),
+                ],
+            ),
+            "collectible",
+            True,
+        ),
+        (types.User(id=42, access_hash=1, min=True), None, False),
+    ],
+)
+async def test_resolve_author_tells_no_username_from_unknown(
+    account: TelethonAccount, client: SubstitutedClient, user: Any, username: Any, known: bool
+) -> None:
+    client.messages[("arenda_msk", 7)] = tg_message(7, sender=user)
+    author = await account.resolve_author(SOURCE)
+    assert (author.tg_user_id, author.username, author.username_known) == (42, username, known)
 
 
 @pytest.mark.parametrize(

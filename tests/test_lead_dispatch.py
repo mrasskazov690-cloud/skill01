@@ -138,6 +138,21 @@ async def test_global_daily_limit_and_zero(
     assert await _operator_of(session_factory, lead) == used
 
 
+async def test_default_daily_limit_is_25_sends_per_account(
+    session_factory: Factory, main_id: int, make_account, settings: Settings
+) -> None:
+    assert settings.ACCOUNT_DAILY_LIMIT == 25  # the default, no override
+    account = (await make_account()).id
+    now = datetime.now(UTC)
+    await _sent_history(session_factory, main_id, account, [now] * 24)
+    lead = await new_message(session_factory, main_id, client=1)
+    assert await _dispatch(session_factory) == lead  # 24 of 25 sent today
+
+    await _sent_history(session_factory, main_id, account, [now])
+    await new_message(session_factory, main_id, client=2)
+    assert await _dispatch(session_factory) is None  # 25 of 25: out of the rotation
+
+
 async def test_day_starts_at_midnight_in_the_configured_time_zone(
     session_factory: Factory, main_id: int, make_account, monkeypatch, settings: Settings
 ) -> None:

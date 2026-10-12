@@ -3,13 +3,19 @@ sender, alternation, limits, approvals, guard, pause, reactions, never-again."""
 
 # ruff: noqa: RUF001  (Russian reply texts by design)
 
+import io
+import json
 import struct
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from itertools import count, pairwise
+from types import SimpleNamespace
 
+import anthropic
+import httpx2
 import pytest
+import structlog
 from pydantic import SecretStr
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -29,6 +35,9 @@ from app.db.models import (
 from app.db.session import transaction
 from app.domain.errors import AutoModeLocked
 from app.domain.states import DraftSource
+from app.drafts.llm import ClaudeDraftProvider
+from app.drafts.profile import load_profile
+from app.logging import configure_logging
 from app.services.approvals import approve, enable_auto_mode, set_paused
 from app.services.outbox import resolve_uncertain
 from app.telegram.base import (
@@ -36,10 +45,13 @@ from app.telegram.base import (
     PeerInvalid,
     PeerRef,
     PrivacyRestricted,
+    ReactionInvalid,
     ResolvedAuthor,
+    SendRefused,
     SendTimeout,
     SentMessage,
     SourceUnavailable,
+    UserRestricted,
     WorkChatMessage,
 )
 from app.telegram.fake import FakeTelegramAccount
@@ -49,6 +61,14 @@ from app.worker.clock import ManualClock
 from app.worker.drafts import Reply
 from app.worker.worker import CURSOR_KEY, INTAKE_ATTEMPTS, Worker
 from tests.helpers import Factory, get, processing_message, queued_reply, rows
+from tests.test_drafts_llm import FIXTURE as LLM_FIXTURE
+from tests.test_drafts_llm import GOOD as GOOD_DRAFT
+from tests.test_drafts_llm import FakeClient
+from tests.test_drafts_llm import response as llm_response
+from tests.test_drafts_llm import result as llm_result
+from tests.test_drafts_llm import status_error as llm_status_error
+
+LLM_PROFILE = load_profile(LLM_FIXTURE)
 
 CHAT = -100_777
 TEMPLATE = "Здравствуйте! Подскажите, пожалуйста, что именно вас интересует?"
@@ -747,3 +767,484 @@ async def test_worker_exits_with_a_message_when_a_session_is_missing(
         await entry.main()
 
     assert str(exc.value.code) == f"account {reader.id}: TG_SESSION_NOWHERE is not set"
+
+
+# --- stage 4 tails (P9) ----------------------------------------------------------------
+
+
+@pytest.fixture
+def log_output() -> Iterator[io.StringIO]:
+    buf = io.StringIO()
+    configure_logging("INFO", buf)
+    yield buf
+    structlog.reset_defaults()
+
+
+def _log_records(buf: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in buf.getvalue().splitlines()]
+
+
+def _reader_message(env: Env, tg_id: int) -> WorkChatMessage:
+    return next(m for m in env.reader.work_chat[CHAT] if m.message_id == tg_id)
+
+
+async def _outboxes(factory: Factory, tg_id: int) -> list[Outbox]:
+    lead = await _lead(factory, tg_id)
+    return await rows(factory, Outbox, Outbox.message_id == lead.id)
+
+
+async def test_privacy_refusal_gets_the_configured_reaction(
+    env: Env, monkeypatch, settings: Settings
+) -> None:
+    monkeypatch.setattr(settings, "REACTION_PRIVACY", "🙈")
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    for fake in env.ops:
+        fake.script(PrivacyRestricted)
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    result = await worker.send_tick()
+
+    sender = next(f for f in env.ops if f.account_id == result.account_id)
+    assert sender.reactions == [(CHAT, tg_id, "🙈")]
+    assert (await _lead(env.factory, tg_id)).reaction == "🙈"
+
+
+async def test_privacy_reaction_the_chat_refuses_falls_back_to_thumbs_down(
+    env: Env, log_output: io.StringIO
+) -> None:
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    for fake in env.ops:
+        fake.script(PrivacyRestricted)
+        fake.script_reactions(ReactionInvalid())  # 🚫 is not allowed in this chat
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    result = await worker.send_tick()
+
+    sender = next(f for f in env.ops if f.account_id == result.account_id)
+    assert sender.reactions == [(CHAT, tg_id, "👎")]
+    lead = await _lead(env.factory, tg_id)
+    assert (lead.status, lead.reaction) == ("failed", "👎")
+    (warning,) = [r for r in _log_records(log_output) if r["event"] == "reaction_invalid"]
+    assert (warning["level"], warning["emoji"], warning["fallback"]) == ("warning", "🚫", "👎")
+    (audit,) = await rows(env.factory, AuditLog, AuditLog.action == "reaction_set")
+    assert audit.details["emoji"] == "👎"
+
+
+async def test_lead_handled_by_hand_before_the_auto_send_is_cancelled(env: Env) -> None:
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+    _reader_message(env, tg_id).reactions.add("❤️")  # a person answered it meanwhile
+
+    assert (await worker.send_tick()).kind == "idle"
+
+    assert not any(f.calls for f in env.ops)
+    assert await _status(env.factory, tg_id) == ("cancelled", "handled_manually")
+    (outbox,) = await _outboxes(env.factory, tg_id)
+    assert (outbox.status, outbox.error) == ("failed", "handled_manually")
+    assert env.reader.reaction_reads == [(CHAT, tg_id)]
+    assert all(not f.reactions for f in env.ops)
+
+
+async def test_approved_draft_of_a_lead_handled_by_hand_is_not_sent(env: Env) -> None:
+    worker = env.worker()
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+    drafted = await worker.send_tick()
+    assert drafted.kind == "draft"
+    async with transaction(env.factory) as s:
+        await approve(s, drafted.message_id, OWNER)  # type: ignore[arg-type]
+    _reader_message(env, tg_id).reactions.add("🚫")
+
+    assert (await worker.send_tick()).kind == "idle"
+
+    assert not any(f.calls for f in env.ops)
+    assert await _status(env.factory, tg_id) == ("cancelled", "handled_manually")
+    (outbox,) = await _outboxes(env.factory, tg_id)
+    assert (outbox.status, outbox.error) == ("failed", "handled_manually")
+
+
+async def test_flood_wait_on_the_reaction_reread_defers_the_send(env: Env) -> None:
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    env.reader.script_reaction_reads(FloodWait(30))
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "deferred"
+    assert not any(f.calls for f in env.ops)
+
+    result = await worker.send_tick()  # the queued reply goes out once the read works
+    assert (result.kind, result.status) == ("sent", "sent")
+    assert await _status(env.factory, tg_id) == ("answered", None)
+
+
+async def test_user_restricted_fails_the_lead_and_pauses_the_account(env: Env) -> None:
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    for fake in env.ops:
+        fake.script(UserRestricted())
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    result = await worker.send_tick()
+
+    assert (result.kind, result.status) == ("sent", "failed")
+    assert await _status(env.factory, tg_id) == ("failed", "user_restricted")
+    (outbox,) = await _outboxes(env.factory, tg_id)
+    assert (outbox.status, outbox.error) == ("failed", "user_restricted")
+    account = await get(env.factory, Account, result.account_id)
+    assert account.state == "paused"
+    other = next(f for f in env.ops if f.account_id != result.account_id)
+    other._outcomes.clear()  # the other account sends normally
+    nxt = env.post(2)
+    await worker.poll_work_chat()
+    assert (await worker.send_tick()).account_id == other.account_id
+    assert await _status(env.factory, nxt) == ("answered", None)
+
+
+async def test_unknown_definitive_refusal_fails_the_lead(
+    env: Env,
+) -> None:
+    worker = env.worker()
+    await _auto_mode(env.factory)
+    for fake in env.ops:
+        fake.script(SendRefused("CHAT_WRITE_FORBIDDEN"))
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+
+    result = await worker.send_tick()
+
+    assert result.status == "failed"
+    assert await _status(env.factory, tg_id) == ("failed", "send_refused")
+    assert (await get(env.factory, Account, result.account_id)).state == "active"
+
+
+async def test_intake_errors_reach_the_log_without_their_text(
+    env: Env, log_output: io.StringIO
+) -> None:
+    secret = "Ищу квартиру, тел +7 900 000-00-00"
+
+    class Broken(FakeTelegramAccount):
+        async def fetch_work_chat(
+            self, chat_id: int, *, min_id: int = 0, limit: int
+        ) -> list[WorkChatMessage]:
+            raise RuntimeError(f"could not parse: {secret}")
+
+    env.reader = Broken(env.reader.account_id)
+    worker = env.worker()
+
+    await worker.run_intake(max_polls=1)
+
+    (record,) = [r for r in _log_records(log_output) if r["event"] == "intake_poll_failed"]
+    assert record["error"] == "runtime_error"
+    assert record["where"].startswith("tests.test_worker:")
+    assert "exception" not in record
+    assert secret not in log_output.getvalue()
+    assert "could not parse" not in log_output.getvalue()
+
+
+async def test_stale_username_is_cleared_when_the_author_has_none(env: Env) -> None:
+    worker = env.worker()
+    env.post(1)  # user1
+    await worker.poll_work_chat()
+    # The profile could not be read: "no username" is unknown, the stored one stays.
+    env.post(author=ResolvedAuthor(1, None, None, username_known=False))
+    await worker.poll_work_chat()
+    (client,) = await rows(env.factory, Client)
+    assert client.username == "user1"
+
+    env.post(author=ResolvedAuthor(1, None, "User 1"))  # the profile has no username now
+    await worker.poll_work_chat()
+
+    (client,) = await rows(env.factory, Client)
+    assert (client.tg_user_id, client.username) == (1, None)
+
+
+async def test_approval_older_than_the_ttl_goes_back_to_the_owner(
+    env: Env, settings: Settings
+) -> None:
+    assert settings.DRAFT_TTL_HOURS == 24  # the default
+    worker = env.worker()
+    tg_id = env.post(1)
+    await worker.poll_work_chat()
+    drafted = await worker.send_tick()
+    async with transaction(env.factory) as s:
+        await approve(s, drafted.message_id, OWNER)  # type: ignore[arg-type]
+        # Approved 25 hours ago (the account sat at its daily limit since).
+        await s.execute(update(Draft).values(decided_at=func.now() - timedelta(hours=25)))
+
+    assert (await worker.send_tick()).kind == "idle"
+
+    assert not any(f.calls for f in env.ops)
+    assert await _status(env.factory, tg_id) == ("awaiting_review", "stale_approval")
+    (outbox,) = await _outboxes(env.factory, tg_id)
+    assert (outbox.status, outbox.error) == ("failed", "stale_approval")
+    old, again = await rows(env.factory, Draft)
+    assert (old.status, again.status) == ("approved", "pending")
+    assert (again.body, again.message_id) == (old.body, old.message_id)
+
+    async with transaction(env.factory) as s:  # the owner approves it again
+        await approve(s, drafted.message_id, OWNER)  # type: ignore[arg-type]
+    result = await worker.send_tick()
+    assert (result.kind, result.status) == ("sent", "sent")
+    assert await _status(env.factory, tg_id) == ("answered", None)
+
+
+async def test_approval_within_the_ttl_is_sent(env: Env) -> None:
+    worker = env.worker()
+    env.post(1)
+    await worker.poll_work_chat()
+    drafted = await worker.send_tick()
+    async with transaction(env.factory) as s:
+        await approve(s, drafted.message_id, OWNER)  # type: ignore[arg-type]
+        await s.execute(update(Draft).values(decided_at=func.now() - timedelta(hours=23)))
+
+    assert (await worker.send_tick()).status == "sent"
+
+
+# --- Claude drafts (DRAFT_PROVIDER=llm) -----------------------------------------------
+
+LEAD_TEXT = "Ищем квартиру в Барселоне на два месяца, заявка с секретной деталью"
+
+
+class _ScriptedClaude(FakeClient):
+    """A substituted Anthropic client answering each call with the next outcome."""
+
+    def __init__(self, *outcomes: object) -> None:
+        super().__init__(None)
+        self.outcomes = list(outcomes)
+
+        async def parse(**kwargs: object) -> object:
+            self.messages.calls.append(dict(kwargs))
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        self.messages.parse = parse  # type: ignore[method-assign]
+
+
+def _claude(env: Env, *outcomes: object, profile: bool = True) -> tuple[Worker, _ScriptedClaude]:
+    client = _ScriptedClaude(*outcomes)
+    provider = ClaudeDraftProvider(client, LLM_PROFILE)
+    return env.worker(drafts=provider, profile=LLM_PROFILE if profile else None), client
+
+
+async def test_llm_draft_is_sent_in_auto_mode(env: Env, log_output: io.StringIO) -> None:
+    worker, client = _claude(env, llm_response(llm_result(review_id="villa")))
+    await _auto_mode(env.factory)
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    result = await worker.send_tick()
+
+    assert (result.kind, result.status) == ("sent", "sent")
+    assert [text for f in env.ops for _, text in f.sent] == [GOOD_DRAFT]
+    (call,) = client.messages.calls
+    assert LEAD_TEXT in call["messages"][0]["content"]  # type: ignore[index]
+    lead = await _lead(env.factory, tg_id)
+    assert lead.meta["draft_info"] == {
+        "provider": "llm",
+        "country": "Испания",
+        "need": "квартира в Барселоне на два месяца",
+        "review_id": "villa",
+        "confidence": 0.9,
+    }
+    # Neither the lead's text nor the draft reaches the log or the audit.
+    assert LEAD_TEXT not in log_output.getvalue()
+    assert GOOD_DRAFT not in log_output.getvalue()
+    for event in await rows(env.factory, AuditLog):
+        assert "секретной" not in json.dumps(event.details, ensure_ascii=False)
+        assert "Барселон" not in json.dumps(event.details, ensure_ascii=False)
+
+
+async def test_llm_draft_waits_for_the_owner_in_confirm_mode(env: Env) -> None:
+    worker, _ = _claude(env, llm_response(llm_result()))
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "draft"
+
+    assert await _status(env.factory, tg_id) == ("awaiting_review", "needs_approval")
+    (draft,) = await rows(env.factory, Draft)
+    assert (draft.body, draft.source, draft.issues) == (GOOD_DRAFT, "llm", [])
+    assert not any(f.calls for f in env.ops)
+
+
+@pytest.mark.parametrize(
+    ("body", "issues"),
+    [
+        ("Здравствуйте! Советую сервис Chit Trip, там без предоплаты.", ["no_disclosure"]),
+        (
+            "Работаю с Chit Trip. Мы сами бронировали там виллу, скидка 20%.",
+            ["percent", "customer_claim"],
+        ),
+        ("Работаю с Chit Trip. Клиенты пишут: «Лучший сервис на свете»", ["misquote"]),
+    ],
+)
+async def test_llm_draft_breaking_the_rules_goes_to_the_owner_even_in_auto_mode(
+    env: Env, body: str, issues: list[str]
+) -> None:
+    worker, _ = _claude(env, llm_response(llm_result(draft=body)))
+    await _auto_mode(env.factory)
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "draft"
+
+    assert not any(f.calls for f in env.ops)
+    assert await _status(env.factory, tg_id) == ("awaiting_review", "needs_approval")
+    (draft,) = await rows(env.factory, Draft)
+    assert draft.issues == issues
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason", "error"),
+    [
+        (
+            llm_response(llm_result(in_scope=False, country="Италия", draft=None)),
+            "out_of_scope",
+            None,
+        ),
+        (
+            llm_response(None, "refusal", stop_details=SimpleNamespace(category=None)),
+            "llm_refusal",
+            "refusal",
+        ),
+        (llm_status_error(400), "llm_error", "http_400"),
+        (llm_status_error(401), "llm_error", "http_401"),
+    ],
+    ids=["out_of_scope", "refusal", "bad_request", "unauthorized"],
+)
+async def test_lead_without_a_draft_goes_to_the_owner(
+    env: Env, outcome: object, reason: str, error: str | None
+) -> None:
+    worker, client = _claude(env, outcome)
+    await _auto_mode(env.factory)
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "idle"
+
+    assert await _status(env.factory, tg_id) == ("awaiting_review", reason)
+    assert await rows(env.factory, Draft) == []
+    assert await rows(env.factory, Outbox) == []
+    assert not any(f.calls for f in env.ops)
+    lead = await _lead(env.factory, tg_id)
+    assert lead.claimed_by is None
+    (event,) = await rows(env.factory, AuditLog, AuditLog.action == "lead_not_drafted")
+    assert event.details["reason"] == reason
+    assert event.details["error"] == error
+    if reason == "out_of_scope":
+        assert lead.meta["draft_info"]["country"] == "Италия"
+    # Nothing more happens to it on later ticks.
+    assert (await worker.send_tick()).kind == "idle"
+    assert len(client.messages.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        llm_status_error(429),
+        llm_status_error(500),
+        llm_status_error(529),
+        anthropic.APIConnectionError(request=httpx2.Request("POST", "https://api.test")),
+    ],
+    ids=["429", "500", "529", "network"],
+)
+async def test_passing_api_error_keeps_the_lead_for_the_next_tick(
+    env: Env, error: BaseException, log_output: io.StringIO
+) -> None:
+    worker, client = _claude(env, error, llm_response(llm_result()))
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    first = await worker.send_tick()
+
+    assert first.kind == "deferred"
+    lead = await _lead(env.factory, tg_id)
+    assert (lead.status, lead.claimed_by) == ("assigned", None)
+    assert await rows(env.factory, Draft) == []
+    (record,) = [r for r in _log_records(log_output) if r["event"] == "draft_unavailable"]
+    assert record["message_id"] == lead.id
+    assert record["error"].startswith("llm_")
+
+    second = await worker.send_tick()
+
+    assert second.kind == "draft"
+    assert second.account_id == first.account_id  # the same operator keeps the lead
+    assert await _status(env.factory, tg_id) == ("awaiting_review", "needs_approval")
+    assert len(client.messages.calls) == 2
+    assert LEAD_TEXT not in log_output.getvalue()
+
+
+async def test_duplicate_leads_cost_no_claude_call(env: Env) -> None:
+    worker, client = _claude(env, llm_response(llm_result()))
+    await _auto_mode(env.factory)
+    first = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+    assert (await worker.send_tick()).kind == "sent"
+    again = env.post(1, text="Ещё раз: ищу квартиру в Барселоне")
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "idle"
+
+    assert len(client.messages.calls) == 1
+    assert await _status(env.factory, first) == ("answered", None)
+    status, _ = await _status(env.factory, again)
+    assert status == "cancelled"
+
+
+async def test_an_existing_dialog_costs_no_claude_call(env: Env) -> None:
+    worker, client = _claude(env)
+    for fake in env.ops:
+        fake.dialogs.add(1)
+    tg_id = env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    await worker.send_tick()
+
+    assert client.messages.calls == []
+    assert await _status(env.factory, tg_id) == ("cancelled", "duplicate_client")
+
+
+async def test_worker_without_profile_checks_only_the_generic_rules(env: Env) -> None:
+    undisclosed = "Здравствуйте! Подскажите, какой район вам удобен?"
+    worker, _ = _claude(env, llm_response(llm_result(draft=undisclosed)), profile=False)
+    await _auto_mode(env.factory)
+    env.post(1, text=LEAD_TEXT)
+    await worker.poll_work_chat()
+
+    assert (await worker.send_tick()).kind == "sent"
+
+
+async def test_worker_refuses_llm_mode_without_the_key(
+    engine: AsyncEngine, make_account, monkeypatch, settings: Settings, tmp_path
+) -> None:
+    reader = await make_account(kind="main", session_env="TG_SESSION_READER")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(settings, "TG_API_ID", 1)
+    monkeypatch.setattr(settings, "TG_API_HASH", SecretStr("h"))
+    monkeypatch.setattr(settings, "WORK_CHAT_ID", CHAT)
+    monkeypatch.setattr(settings, "READER_ACCOUNT_ID", reader.id)
+    monkeypatch.setattr(settings, "DRAFT_PROVIDER", "llm")
+    monkeypatch.setattr(settings, "PROFILE_PATH", str(LLM_FIXTURE))
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", None)
+    monkeypatch.setattr(entry, "configure_logging", lambda level: None)
+    monkeypatch.setattr(entry, "create_engine", lambda: engine)
+
+    with pytest.raises(SystemExit) as exc:
+        await entry.main()
+    assert str(exc.value.code) == "DRAFT_PROVIDER=llm needs ANTHROPIC_API_KEY"
+
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", SecretStr("sk-test-only"))
+    monkeypatch.setattr(settings, "PROFILE_PATH", str(tmp_path / "missing.yaml"))
+    with pytest.raises(SystemExit) as exc:
+        await entry.main()
+    assert "profile file not found" in str(exc.value.code)

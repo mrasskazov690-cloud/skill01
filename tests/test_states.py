@@ -16,7 +16,7 @@ from app.domain.states import (
 EXPECTED_MESSAGE = {
     "pending": {"assigned", "awaiting_review", "cancelled"},
     "assigned": {"assigned", "processing", "awaiting_review", "cancelled"},
-    "processing": {"assigned", "awaiting_review", "answered", "failed"},
+    "processing": {"assigned", "awaiting_review", "answered", "failed", "cancelled"},
     "awaiting_review": {"assigned", "answered", "cancelled", "pending"},
     "failed": {"cancelled", "pending"},
     "answered": set(),

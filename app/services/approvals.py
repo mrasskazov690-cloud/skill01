@@ -6,9 +6,10 @@ carry ids, statuses and issue codes, never the draft body or the client's text.
 """
 
 from collections.abc import Sequence
-from typing import Any
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from sqlalchemy import Row, func, select, update
+from sqlalchemy import Row, and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,17 +22,26 @@ from app.domain.states import (
     DraftStatus,
     MessageStatus,
     OutboxKind,
+    SendStatus,
 )
 from app.services.audit import write_audit
 from app.services.claims import claim_message
 from app.services.guard import check_draft
 from app.services.outbox import enqueue_reply
-from app.services.transitions import change_message_status
+from app.services.transitions import (
+    change_message_status,
+    change_message_status_if_allowed,
+    change_send_status,
+)
+
+if TYPE_CHECKING:
+    from app.drafts.profile import ServiceProfile
 
 NEEDS_APPROVAL = "needs_approval"
 REJECTED_BY_OWNER = "rejected_by_owner"
 AUTO_MODE = "auto_mode"
 PAUSED = "paused"
+STALE_APPROVAL = "stale_approval"
 _RELEASED = {"claimed_by": None, "lease_expires_at": None}
 
 
@@ -169,6 +179,160 @@ async def reject(session: AsyncSession, message_id: int, actor: str) -> None:
     )
 
 
+class DraftDecision(NamedTuple):
+    """What a decision by draft id did: 'approved', 'rejected', 'edited', 'not_found',
+    or 'already_<status>' when the draft was decided before (a repeated button press)."""
+
+    outcome: str
+    message_id: int | None = None
+    outbox_id: int | None = None
+    issues: tuple[str, ...] = ()
+
+
+async def approve_draft(session: AsyncSession, draft_id: int, actor: str) -> DraftDecision:
+    """approve() for exactly this draft. A draft decided before is left as it is, so
+    pressing the button again changes nothing."""
+    draft = await _lock_draft(session, draft_id)
+    if draft is None:
+        return DraftDecision("not_found")
+    if draft.status != DraftStatus.PENDING:
+        return DraftDecision(f"already_{draft.status}", draft.message_id)
+    outbox = await approve(session, draft.message_id, actor)
+    return DraftDecision("approved", draft.message_id, outbox.id)
+
+
+async def reject_draft(session: AsyncSession, draft_id: int, actor: str) -> DraftDecision:
+    """reject() for exactly this draft; a draft decided before is left as it is."""
+    draft = await _lock_draft(session, draft_id)
+    if draft is None:
+        return DraftDecision("not_found")
+    if draft.status != DraftStatus.PENDING:
+        return DraftDecision(f"already_{draft.status}", draft.message_id)
+    await reject(session, draft.message_id, actor)
+    return DraftDecision("rejected", draft.message_id)
+
+
+async def edit_draft(
+    session: AsyncSession,
+    draft_id: int,
+    body: str,
+    actor: str,
+    profile: "ServiceProfile | None" = None,
+) -> DraftDecision:
+    """Replace the text of a pending draft with the owner's own. The new text is a
+    manual draft: the guard checks it (with the profile) and its issues are stored
+    for the card; it is still sent only when the owner approves it."""
+    draft = await _lock_draft(session, draft_id)
+    if draft is None:
+        return DraftDecision("not_found")
+    if draft.status != DraftStatus.PENDING:
+        return DraftDecision(f"already_{draft.status}", draft.message_id)
+    found = check_draft(body, DraftSource.MANUAL, profile)
+    await session.execute(
+        update(Draft)
+        .where(Draft.id == draft.id)
+        .values(body=body, source=DraftSource.MANUAL.value, issues=found)
+        .execution_options(synchronize_session=False)
+    )
+    await write_audit(
+        session,
+        actor,
+        "draft_edited",
+        "draft",
+        draft.id,
+        {"message_id": draft.message_id, "source_before": draft.source, "issues": found},
+    )
+    return DraftDecision("edited", draft.message_id, issues=tuple(found))
+
+
+async def expire_stale_approvals(session: AsyncSession, actor: str = "system:approvals") -> int:
+    """Approved replies still queued DRAFT_TTL_HOURS after approval (daily limit, flood
+    waits, a switched-off account) are not sent that late: the queued row fails, the
+    message goes back to the owner as awaiting_review('stale_approval') with a new
+    pending draft of the same text, to approve again or reject. Returns how many."""
+    ttl = timedelta(hours=get_settings().DRAFT_TTL_HOURS)
+    stale = (
+        await session.execute(
+            select(Outbox.id, Outbox.message_id, Draft.id.label("draft_id"))
+            .join(
+                Draft,
+                and_(
+                    Draft.message_id == Outbox.message_id,
+                    # approve() queues each draft under the key draft:<id>.
+                    Outbox.idempotency_key == func.concat("draft:", Draft.id),
+                ),
+            )
+            .where(
+                Outbox.status == SendStatus.QUEUED.value,
+                Draft.status == DraftStatus.APPROVED.value,
+                func.coalesce(Draft.decided_at, Draft.created_at) < func.now() - ttl,
+            )
+            .order_by(Outbox.message_id)
+        )
+    ).all()
+    expired = 0
+    for outbox_id, message_id, draft_id in stale:
+        # Lock order: message -> outbox; re-checked under the locks.
+        message = await _lock_message(session, message_id)
+        row = (
+            await session.execute(
+                select(Outbox.status, Outbox.kind, Outbox.body, Outbox.account_id)
+                .where(Outbox.id == outbox_id)
+                .with_for_update()
+            )
+        ).one()
+        if row.status != SendStatus.QUEUED:
+            continue
+        draft = await session.get_one(Draft, draft_id)
+        await change_send_status(
+            session,
+            outbox_id,
+            SendStatus.QUEUED,
+            SendStatus.FAILED,
+            actor=actor,
+            action="send_cancelled",
+            values={"error": STALE_APPROVAL},
+            details={"message_id": message_id, "draft_id": draft.id, "reason": STALE_APPROVAL},
+        )
+        if not await change_message_status_if_allowed(
+            session,
+            message_id,
+            message.status,
+            MessageStatus.AWAITING_REVIEW,
+            actor=actor,
+            action="message_needs_approval",
+            values={**_RELEASED, "review_reason": STALE_APPROVAL},
+            details={"draft_id": draft.id, "reason": STALE_APPROVAL},
+        ):
+            continue
+        # An edited template went out as a manual reply; offer it again as such.
+        source = (
+            DraftSource.MANUAL
+            if draft.source == DraftSource.TEMPLATE and row.kind != OutboxKind.TEMPLATE
+            else DraftSource(draft.source)
+        )
+        again = Draft(
+            message_id=message_id,
+            account_id=row.account_id,
+            body=row.body,
+            source=source.value,
+            status=DraftStatus.PENDING.value,
+            issues=list(draft.issues),
+        )
+        session.add(again)
+        await session.flush()
+        await write_audit(
+            session,
+            actor,
+            "approval_expired",
+            "draft",
+            draft.id,
+            {"message_id": message_id, "outbox_id": outbox_id, "new_draft_id": again.id},
+        )
+        expired += 1
+    return expired
+
+
 async def approved_count(session: AsyncSession) -> int:
     count = await session.scalar(
         select(func.count()).select_from(Draft).where(Draft.status == DraftStatus.APPROVED.value)
@@ -253,3 +417,17 @@ async def _lock_pending_draft(session: AsyncSession, message_id: int) -> Draft:
     if draft is None:
         raise WrongState(f"message {message_id} has no pending draft")
     return draft
+
+
+async def _lock_draft(session: AsyncSession, draft_id: int) -> Draft | None:
+    """The draft, locked after its message (lock order: message -> draft)."""
+    message_id = await session.scalar(select(Draft.message_id).where(Draft.id == draft_id))
+    if message_id is None:
+        return None
+    await _lock_message(session, message_id)
+    return await session.scalar(
+        select(Draft)
+        .where(Draft.id == draft_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )

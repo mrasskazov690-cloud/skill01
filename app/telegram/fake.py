@@ -40,12 +40,14 @@ class FakeTelegramAccount:
         self._account_id = account_id
         self._outcomes: deque[Outcome] = deque(outcomes)
         self._react_outcomes: deque[ReactOutcome] = deque()
+        self._reaction_read_outcomes: deque[ReactOutcome] = deque()
         self.health = health or AccountHealth(AccountState.ACTIVE)
         self.delay = delay
         self.calls: list[tuple[PeerRef, str]] = []  # every send_text attempt
         self.sent: list[tuple[PeerRef, str]] = []  # attempts that returned success
         self.random_ids: list[int | None] = []  # random_id of every send_text attempt
         self.reactions: list[tuple[int, int, str]] = []  # successful (chat, message, emoji)
+        self.reaction_reads: list[tuple[int, int]] = []  # every fetch_reactions call
         self.work_chat: dict[int, list[WorkChatMessage]] = {}
         self.authors: dict[LeadLink, ResolvedAuthor | BaseException] = {}
         self.dialogs: set[int] = set()  # users this account has written to in private
@@ -67,6 +69,11 @@ class FakeTelegramAccount:
     def script_reactions(self, *outcomes: ReactOutcome) -> None:
         """Queue outcomes for the next react calls; when empty, reactions succeed."""
         self._react_outcomes.extend(outcomes)
+
+    def script_reaction_reads(self, *outcomes: ReactOutcome) -> None:
+        """Queue outcomes for the next fetch_reactions calls; when empty, they read the
+        work chat."""
+        self._reaction_read_outcomes.extend(outcomes)
 
     def add_work_message(self, message: WorkChatMessage) -> None:
         self.work_chat.setdefault(message.chat_id, []).append(message)
@@ -122,6 +129,16 @@ class FakeTelegramAccount:
         if _is_error(outcome):
             raise outcome  # type: ignore[misc]
         self.reactions.append((chat_id, message_id, emoji))
+
+    async def fetch_reactions(self, chat_id: int, message_id: int) -> set[str]:
+        self.reaction_reads.append((chat_id, message_id))
+        outcome = self._reaction_read_outcomes.popleft() if self._reaction_read_outcomes else None
+        if _is_error(outcome):
+            raise outcome  # type: ignore[misc]
+        for message in self.work_chat.get(chat_id, ()):
+            if message.message_id == message_id:
+                return set(message.reactions)
+        raise SourceUnavailable(f"message {message_id}")
 
     async def check_connection(self) -> AccountHealth:
         return self.health

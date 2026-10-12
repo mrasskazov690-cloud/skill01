@@ -71,3 +71,27 @@ def test_validation_error_does_not_echo_values(
 def test_non_postgres_url_rejected() -> None:
     with pytest.raises(ValueError):
         async_url("sqlite:///x.db")
+
+
+def test_send_limits_and_tail_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ACCOUNT_DAILY_LIMIT", "REACTION_PRIVACY", "DRAFT_TTL_HOURS"):
+        monkeypatch.delenv(name, raising=False)
+    settings = _settings(DATABASE_URL=URL)
+    assert settings.ACCOUNT_DAILY_LIMIT == 25  # 50 a day on two accounts
+    assert settings.REACTION_PRIVACY == "🚫"
+    assert settings.DRAFT_TTL_HOURS == 24
+
+
+def test_draft_provider_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("DRAFT_PROVIDER", "ANTHROPIC_API_KEY", "PROFILE_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    settings = _settings(DATABASE_URL=URL)
+    assert settings.DRAFT_PROVIDER == "template"
+    assert settings.ANTHROPIC_API_KEY is None
+    assert settings.PROFILE_PATH == "profile.local.yaml"
+
+
+def test_draft_provider_is_llm_or_template() -> None:
+    assert _settings(DATABASE_URL=URL, DRAFT_PROVIDER="llm").DRAFT_PROVIDER == "llm"
+    with pytest.raises(ValidationError):
+        _settings(DATABASE_URL=URL, DRAFT_PROVIDER="gpt")

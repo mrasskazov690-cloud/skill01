@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 DispatchOrder = Literal["newest_first", "oldest_first"]
+DraftProviderName = Literal["llm", "template"]
 
 
 class Settings(BaseSettings):
@@ -44,10 +45,27 @@ class Settings(BaseSettings):
     # Sending: one send per interval system-wide, a daily cap per account (counted in
     # TIMEZONE), the first CONFIRM_FIRST_N replies only after the owner approves them.
     SEND_INTERVAL_SECONDS: int = Field(default=120, ge=1)
-    ACCOUNT_DAILY_LIMIT: int = Field(default=20, ge=0)
+    ACCOUNT_DAILY_LIMIT: int = Field(default=25, ge=0)
     CONFIRM_FIRST_N: int = Field(default=20, ge=0)
     TIMEZONE: str = "Europe/Moscow"
     SEND_RETRY_UNCERTAIN_WITH_RANDOM_ID: bool = False
+    # The reaction a lead gets when the author's privacy refuses our message. If the
+    # work chat does not allow it (REACTION_INVALID), the worker falls back to 👎.
+    REACTION_PRIVACY: str = Field(default="🚫", min_length=1, max_length=16)
+    # An approved draft not sent within this many hours of approval is not sent: it
+    # goes back to the owner (awaiting_review('stale_approval')).
+    DRAFT_TTL_HOURS: int = Field(default=24, ge=1)
+
+    # Drafts: 'template' (the active template) or 'llm' (Claude, needs the key and the
+    # service profile). The key is read like every secret here, never from code.
+    DRAFT_PROVIDER: DraftProviderName = "template"
+    ANTHROPIC_API_KEY: SecretStr | None = None
+    PROFILE_PATH: str = "profile.local.yaml"
+
+    # The owner's panel (python -m app.bot): the bot token is a secret; only the
+    # Telegram user OWNER_TG_USER_ID may use the bot, everyone else is ignored.
+    BOT_TOKEN: SecretStr | None = None
+    OWNER_TG_USER_ID: int | None = None
 
     @field_validator("LOG_LEVEL", mode="before")
     @classmethod

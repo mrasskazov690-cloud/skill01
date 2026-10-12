@@ -73,6 +73,9 @@ _sent_today = (
     .correlate(Account)
     .scalar_subquery()
 )
+# Public names for reports (the owner's /status): replies sent today, the daily limit.
+SENT_TODAY = _sent_today
+DAILY_LIMIT: ColumnElement[int] = func.coalesce(Account.daily_send_limit, _DAILY_LIMIT)
 # SQL condition on Account: may send right now (switched on, on shift, not limited by
 # Telegram, under its daily limit). Checked again at send time, because a reply may be
 # queued or left assigned long after its assignment (approved drafts, resumed leads).
@@ -82,7 +85,7 @@ CAN_SEND: ColumnElement[bool] = and_(
     Account.on_shift.is_(True),
     Account.state == AccountState.ACTIVE.value,
     or_(Account.flood_wait_until.is_(None), Account.flood_wait_until <= func.now()),
-    _sent_today < func.coalesce(Account.daily_send_limit, _DAILY_LIMIT),
+    _sent_today < DAILY_LIMIT,
 )
 # SQL condition on Account: may receive new assignments right now.
 ELIGIBLE: ColumnElement[bool] = and_(

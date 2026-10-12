@@ -15,6 +15,9 @@ from app.config import get_settings
 from app.db.models import Account
 from app.db.session import create_engine, create_sessionmaker
 from app.domain.states import AccountKind
+from app.drafts.llm import ClaudeDraftProvider
+from app.drafts.profile import ProfileError
+from app.drafts.setup import DraftSetupError, make_draft_provider
 from app.logging import configure_logging, get_logger
 from app.telegram.base import TelegramAccount
 from app.telegram.telethon_account import TelethonAccount
@@ -29,6 +32,10 @@ async def main() -> None:
         sys.exit("TG_API_ID and TG_API_HASH must be set")
     if settings.WORK_CHAT_ID is None or settings.READER_ACCOUNT_ID is None:
         sys.exit("WORK_CHAT_ID and READER_ACCOUNT_ID must be set")
+    try:
+        drafts, profile = make_draft_provider(settings)
+    except (ProfileError, DraftSetupError) as exc:  # names the problem, not the contents
+        sys.exit(str(exc))
     engine = create_engine()
     factory = create_sessionmaker(engine)
     try:
@@ -46,6 +53,8 @@ async def main() -> None:
         if not any(a.id == settings.READER_ACCOUNT_ID and a.session_env for a in accounts):
             sys.exit("READER_ACCOUNT_ID must be an enabled account with session_env")
         async with AsyncExitStack() as stack:
+            if isinstance(drafts, ClaudeDraftProvider):
+                stack.push_async_callback(drafts.aclose)
             adapters: dict[int, TelegramAccount] = {}
             for account in accounts:
                 if not account.session_env:
@@ -60,8 +69,13 @@ async def main() -> None:
                 except ValueError as exc:  # names the variable, never its value
                     sys.exit(f"account {account.id}: {exc}")
                 adapters[account.id] = await stack.enter_async_context(adapter)
-            log.info("worker_starting", accounts=sorted(adapters))
-            await Worker(engine, factory, adapters).run()
+            log.info(
+                "worker_starting",
+                accounts=sorted(adapters),
+                draft_provider=settings.DRAFT_PROVIDER,
+                profile=profile is not None,
+            )
+            await Worker(engine, factory, adapters, drafts=drafts, profile=profile).run()
     finally:
         await engine.dispose()
 

@@ -1,7 +1,10 @@
 # ruff: noqa: RUF001  (Russian reply texts by design)
 
+from pathlib import Path
+
 import pytest
 
+from app.drafts.profile import load_profile
 from app.services.guard import MAX_DRAFT_LENGTH, check_draft
 
 
@@ -54,3 +57,153 @@ def test_non_template_sources_are_checked(source: str) -> None:
 
 def test_owner_approved_templates_are_not_checked() -> None:
     assert check_draft("Цена 100 руб, свободна с 12.10" + "!" * 2000, "template") == []
+
+
+# --- P5: the advertising rules ------------------------------------------------------
+
+PROFILE = load_profile(Path(__file__).parent / "fixtures" / "profile.yaml")
+DISCLOSED = "Советую сервис Chit Trip, с которым сотрудничаю: жильё напрямую от собственников."
+VILLA = PROFILE.reviews[0].text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        DISCLOSED + " Подскажите, какой город вам интересен?",
+        "Я работаю с Чит Трип и могу помочь найти выгодно. Какие даты поездки вам удобны?",
+        f"Представляю сервис Chit Trip. Клиенты пишут: «{VILLA}»",
+        # A word-for-word fragment, also with an ellipsis around it.
+        DISCLOSED + " Из отзыва: «хозяин очень приветливый»",
+        DISCLOSED + " «…Билеты оформили быстро и без лишних вопросов…»",
+        # A quoted name is a name, not a review.
+        "Сотрудничаю с сервисом «Chit Trip»: без предоплаты.",
+        # The customer's story is fine inside the quote.
+        "Работаю с Chit Trip. «Нашли виллу у моря за один вечер, хозяин очень приветливый.»",
+        "Мы подберём жильё без предоплаты, я сотрудничаю с Chit Trip.",
+    ],
+)
+def test_correct_draft_passes(body: str) -> None:
+    assert check_draft(body, "llm", PROFILE) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Советую сервис Chit Trip, там без предоплаты.",  # a recommendation is not a disclosure
+        "Я сотрудничаю с хорошим сервисом, напишите мне.",  # no name
+        "Отличный сервис Chit Trip! «Сотрудничаю»",  # the phrase only inside quotes
+        "Отличный сервис! «Я сотрудничаю с Chit Trip»",  # disclosure only inside quotes
+    ],
+)
+def test_no_disclosure(body: str) -> None:
+    assert "no_disclosure" in check_draft(body, "llm", PROFILE)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Мы сами бронировали через Chit Trip, очень довольны.",
+        "Я тоже снимала там квартиру.",
+        "Летали с мужем в Таиланд — всё отлично.",
+        "Мы уже забронировали так виллу на Бали.",
+        "Нам подобрали квартиру за день.",
+        "Я лично пользовалась этим сервисом.",
+        "Сами брали билеты, без проблем.",
+        "Наша поездка прошла отлично.",
+        "Как клиент скажу: рекомендую.",
+        "Ёлки, мы жили там месяц.",
+    ],
+)
+def test_customer_claims_outside_quotes(body: str) -> None:
+    assert "customer_claim" in check_draft(DISCLOSED + " " + body, "llm", PROFILE)
+    # Without the profile too: posing as a customer is never fine.
+    assert "customer_claim" in check_draft(body, "manual")
+
+
+@pytest.mark.parametrize(
+    ("body", "issue"),
+    [
+        ("Скидка 10% для вас", "percent"),
+        ("Скидка десять процентов", "percent"),
+        ("Можно снять за полцены", "half_price"),
+        ("Почти за пол-цены", "half_price"),
+        ("Половину стоимости вернут", "half_price"),
+        ("В 2 раза дешевле, чем у агентств", "times_comparison"),
+        ("В полтора раза выгоднее", "times_comparison"),
+        ("Вдвое дешевле рынка", "times_comparison"),
+        ("Всего 500 долларов в месяц", "price"),
+        ("От 300 евро", "price"),
+        ("15000 бат за месяц", "price"),
+        ("2000 AED", "price"),
+        ("Около 3 млн рупий", "price"),
+    ],
+)
+def test_numbers_and_comparisons(body: str, issue: str) -> None:
+    assert issue in check_draft(DISCLOSED + " " + body, "llm", PROFILE)
+    assert issue in check_draft(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Евроремонт и 3 батареи",  # currency-looking words that are not currencies
+        "Несколько раз помогали с жильём",  # "раз" without "в N раз"
+    ],
+)
+def test_no_false_alarm_on_similar_words(body: str) -> None:
+    assert check_draft(body) == []
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "Нашли виллу у моря за один вечер, хозяин очень приветливый! Спасибо!",  # changed
+        "Нашли виллу у моря за час",  # invented
+        "Лучший сервис, всем советую",  # not in the profile at all
+        "",
+    ],
+)
+def test_misquote(quote: str) -> None:
+    assert "misquote" in check_draft(f"{DISCLOSED} «{quote}»", "llm", PROFILE)
+
+
+@pytest.mark.parametrize("marks", [("“", "”"), ('"', '"'), ("„", "“")])
+def test_other_quote_marks_are_quotes_too(marks: tuple[str, str]) -> None:
+    left, right = marks
+    assert check_draft(f"{DISCLOSED} {left}{VILLA}{right}", "llm", PROFILE) == []
+    assert "misquote" in check_draft(f"{DISCLOSED} {left}Придумано{right}", "llm", PROFILE)
+
+
+def test_quote_whitespace_is_normalized() -> None:
+    spaced = VILLA.replace(" ", "  \n", 2)
+    assert check_draft(f"{DISCLOSED} «{spaced}»", "llm", PROFILE) == []
+
+
+def test_at_most_one_quote() -> None:
+    tickets = PROFILE.reviews[1].text
+    issues = check_draft(f"{DISCLOSED} «{VILLA}» и ещё «{tickets}»", "llm", PROFILE)
+    assert issues == ["too_many_quotes"]
+
+
+def test_profile_rules_need_the_profile() -> None:
+    assert check_draft("Советую этот сервис. «Придумано»") == []
+    assert check_draft("Советую этот сервис. «Придумано»", "llm", PROFILE) == [
+        "no_disclosure",
+        "misquote",
+    ]
+
+
+def test_templates_skip_the_profile_rules_too() -> None:
+    assert check_draft("Мы сами бронировали, скидка 50%", "template", PROFILE) == []
+
+
+def test_all_issues_together() -> None:
+    body = "Мы сами бронировали за 45 000 руб., в 2 раза дешевле! «Выдумка» и «ещё»"
+    assert check_draft(body, "llm", PROFILE) == [
+        "price",
+        "times_comparison",
+        "customer_claim",
+        "no_disclosure",
+        "too_many_quotes",
+        "misquote",
+    ]

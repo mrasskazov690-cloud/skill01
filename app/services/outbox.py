@@ -40,6 +40,7 @@ from app.telegram.base import (
     PermanentSendError,
     SentMessage,
     TelegramAccount,
+    UserRestricted,
 )
 from app.telegram.links import LeadLink
 
@@ -429,6 +430,42 @@ async def resolve_uncertain(
     )
 
 
+async def cancel_queued_send(
+    session: AsyncSession, outbox_id: int, *, reason: str, actor: str
+) -> bool:
+    """Withdraw a queued reply that must not go out (e.g. people handled the lead by
+    hand meanwhile): the row fails with `reason` and the message is cancelled with it.
+    False if the row is no longer queued (nothing changed)."""
+    message_id = await session.scalar(select(Outbox.message_id).where(Outbox.id == outbox_id))
+    if message_id is None:
+        raise NotFound(f"outbox {outbox_id}")
+    message = await _lock_message(session, message_id)
+    status = await _lock_outbox_status(session, outbox_id)
+    if status != SendStatus.QUEUED:
+        return False
+    await change_send_status(
+        session,
+        outbox_id,
+        SendStatus.QUEUED,
+        SendStatus.FAILED,
+        actor=actor,
+        action="send_cancelled",
+        values={"error": reason},
+        details={"message_id": message_id, "reason": reason},
+    )
+    await change_message_status_if_allowed(
+        session,
+        message_id,
+        message.status,
+        MessageStatus.CANCELLED,
+        actor=actor,
+        action="message_cancelled",
+        values={"review_reason": reason, "claimed_by": None, "lease_expires_at": None},
+        details={"outbox_id": outbox_id, "reason": reason},
+    )
+    return True
+
+
 async def recover_interrupted_sends(session: AsyncSession) -> int:
     """Startup sweep: 'sending' means the process died between the two transactions of
     execute_send, so the reply may have been delivered. Such rows become 'uncertain'
@@ -595,6 +632,15 @@ async def _apply_account_effect(
             AccountState.RESTRICTED,
             reason="peer_flood",
             from_states=tuple(s for s in AccountState if s is not AccountState.RESTRICTED),
+        )
+    elif isinstance(outcome, UserRestricted):
+        # Telegram restricted the account: it stops sending until a person resumes it.
+        await _set_account_state(
+            session,
+            account_id,
+            AccountState.PAUSED,
+            reason="user_restricted",
+            from_states=(AccountState.ACTIVE, AccountState.FLOOD_WAIT, AccountState.DISCONNECTED),
         )
     elif isinstance(outcome, SentMessage):
         await _set_account_state(

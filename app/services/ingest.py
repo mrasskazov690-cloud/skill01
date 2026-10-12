@@ -23,12 +23,15 @@ _MAX_ATTEMPTS = 3
 @dataclass(frozen=True, slots=True)
 class ClientRef:
     """How the client is known: Telegram user id and/or @username. A lead whose author
-    could not be determined gets `external_key` (`msg:<chat>/<message_id>`) instead."""
+    could not be determined gets `external_key` (`msg:<chat>/<message_id>`) instead.
+    `username_known=True` says the author's profile was read, so `username=None` means
+    the user has no username now (a stored one is stale); by default None is "unknown"."""
 
     tg_user_id: int | None = None
     username: str | None = None
     display_name: str | None = None
     external_key: str | None = None
+    username_known: bool = False
 
     @property
     def normalized_username(self) -> str | None:
@@ -140,7 +143,8 @@ async def _lock_conversation(
 async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
     """Find or create the client. tg_user_id wins over username; a client first seen
     by username only gets its tg_user_id attached when it later shows up with both.
-    A client found by tg_user_id gets the username it shows up with now."""
+    A client found by tg_user_id gets the username it shows up with now, or loses its
+    stored one if it is known to have none."""
     username = ref.normalized_username
     if ref.tg_user_id is None and username is None:
         if ref.external_key is None:
@@ -157,6 +161,12 @@ async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
             if found is not None:
                 if username is not None and found.username != username:
                     await _refresh_username(session, found.id, username)
+                elif username is None and ref.username_known and found.username is not None:
+                    # The author has no username any more: the stored one was released
+                    # and may belong to someone else soon.
+                    await session.execute(
+                        update(Client).where(Client.id == found.id).values(username=None)
+                    )
                 return found.id
 
         insert_username = username

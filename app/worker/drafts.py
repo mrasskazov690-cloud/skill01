@@ -1,7 +1,14 @@
-"""Where reply drafts come from. Templates now; an LLM provider plugs in later."""
+"""Where reply drafts come from: the active template, or Claude (app.drafts.llm).
 
-from dataclasses import dataclass
-from typing import Protocol
+A provider answers with a Reply, with NoDraft (the lead goes to the owner with that
+review reason) or None (no template: 'no_template'). It raises DraftUnavailable for a
+passing failure (rate limit, server error, network): the lead stays in the queue and
+is tried again on the next tick.
+"""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,11 +25,31 @@ class Reply:
     source: DraftSource
     template_id: int | None = None
     template_version: int | None = None
+    # What the provider made of the lead (country, need...), kept in messages.meta
+    # under "draft_info" for the owner's card. Never logged.
+    info: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class NoDraft:
+    """No reply for this lead: it goes to the owner as awaiting_review(reason)."""
+
+    reason: str
+    error: str | None = None  # an error code for the audit log, never text
+    info: Mapping[str, Any] = field(default_factory=dict)
+
+
+class DraftUnavailable(Exception):
+    """The provider cannot answer right now; try the lead again later."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class DraftProvider(Protocol):
-    async def draft(self, session: AsyncSession, message_id: int) -> Reply | None:
-        """A reply for the lead, or None when there is nothing to offer."""
+    async def draft(self, session: AsyncSession, message_id: int) -> Reply | NoDraft | None:
+        """A reply for the lead, NoDraft, or None when there is no template."""
         ...
 
 

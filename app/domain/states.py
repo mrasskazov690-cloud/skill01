@@ -78,7 +78,11 @@ ALLOWED_TRANSITIONS: Mapping[MessageStatus, frozenset[MessageStatus]] = MappingP
     {
         _M.PENDING: frozenset({_M.ASSIGNED, _M.AWAITING_REVIEW, _M.CANCELLED}),
         _M.ASSIGNED: frozenset({_M.ASSIGNED, _M.PROCESSING, _M.AWAITING_REVIEW, _M.CANCELLED}),
-        _M.PROCESSING: frozenset({_M.ASSIGNED, _M.AWAITING_REVIEW, _M.ANSWERED, _M.FAILED}),
+        # processing -> cancelled: people handled the lead by hand before its reply was
+        # sent (cancel_queued_send).
+        _M.PROCESSING: frozenset(
+            {_M.ASSIGNED, _M.AWAITING_REVIEW, _M.ANSWERED, _M.FAILED, _M.CANCELLED}
+        ),
         _M.AWAITING_REVIEW: frozenset({_M.ASSIGNED, _M.ANSWERED, _M.CANCELLED, _M.PENDING}),
         _M.FAILED: frozenset({_M.CANCELLED, _M.PENDING}),
         _M.ANSWERED: frozenset(),

@@ -1,0 +1,16 @@
+# Test profile. The reviews are invented for tests; real ones live only in
+# profile.local.yaml, which is git-ignored.
+name: Chit Trip
+aliases: [Чит Трип]
+countries: [Индонезия, Таиланд, ОАЭ, Черногория, Испания]
+services: [жильё, экскурсии, авиабилеты]
+facts:
+  - Жильё напрямую от собственников
+  - Без предоплаты
+  - Помогаем найти выгодно
+disclosure_phrases: [сотрудничаю, работаю с, представляю]
+reviews:
+  - id: villa
+    text: "Нашли виллу у моря за один вечер, хозяин очень приветливый. Спасибо команде за подбор!"
+  - id: tickets
+    text: "Билеты оформили быстро и без лишних вопросов, всё прошло спокойно."

@@ -36,10 +36,14 @@ class SentMessage:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedAuthor:
+    """`username_known=False`: the adapter could not see the user's profile, so a None
+    username means "unknown", not "the user has none"."""
+
     tg_user_id: int
     username: str | None
     display_name: str | None
     is_bot: bool = False
+    username_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +91,11 @@ class TelegramAccount(Protocol):
 
     async def react(self, chat_id: int, message_id: int, emoji: str) -> None: ...
 
+    async def fetch_reactions(self, chat_id: int, message_id: int) -> set[str]:
+        """The emoji reactions a work-chat message carries now. Raises SourceUnavailable
+        if the message cannot be read (deleted, not a member)."""
+        ...
+
     async def check_connection(self) -> AccountHealth: ...
 
 
@@ -128,6 +137,25 @@ class PrivacyRestricted(PermanentSendError):
 
 class UserBlocked(PermanentSendError):
     """The user has blocked this account."""
+
+
+class UserRestricted(PermanentSendError):
+    """Telegram restricted this account (USER_RESTRICTED, spam reports): nothing was
+    sent, and the account must stop sending until a person looks at it."""
+
+
+class SendRefused(PermanentSendError):
+    """Telegram refused the send with an error that has no mapping of its own (a 4xx
+    answer such as CHAT_WRITE_FORBIDDEN): the server answered, nothing was delivered.
+    `rpc_error` is Telegram's error name, never client text."""
+
+    def __init__(self, rpc_error: str = "") -> None:
+        super().__init__(rpc_error)
+        self.rpc_error = rpc_error
+
+
+class ReactionInvalid(TelegramError):
+    """The chat does not allow this reaction (REACTION_INVALID)."""
 
 
 class SourceUnavailable(TelegramError):

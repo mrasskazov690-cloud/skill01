@@ -43,11 +43,14 @@ from app.telegram.base import (
     PeerMismatch,
     PeerRef,
     PrivacyRestricted,
+    ReactionInvalid,
     ResolvedAuthor,
+    SendRefused,
     SendTimeout,
     SentMessage,
     SourceUnavailable,
     UserBlocked,
+    UserRestricted,
     WorkChatMessage,
 )
 from app.telegram.links import LeadLink, extract_links
@@ -75,6 +78,15 @@ _TIMEOUTS: tuple[type[BaseException], ...] = (
     errors.ServerError,
     errors.TimedOutError,
 )
+# A send answered with one of these (and no mapping of its own) was refused by the
+# server: nothing was delivered, so it is a definitive failure, not an uncertain one.
+_REFUSALS: tuple[type[BaseException], ...] = (
+    errors.BadRequestError,
+    errors.UnauthorizedError,
+    errors.ForbiddenError,
+    errors.NotFoundError,
+    errors.AuthKeyError,
+)
 
 
 def map_error(exc: BaseException) -> BaseException | None:
@@ -90,6 +102,10 @@ def map_error(exc: BaseException) -> BaseException | None:
             return PrivacyRestricted()
         case errors.UserIsBlockedError():
             return UserBlocked()
+        case errors.UserRestrictedError():
+            return UserRestricted()
+        case errors.ReactionInvalidError():
+            return ReactionInvalid()
         case errors.InputUserDeactivatedError() | errors.PeerIdInvalidError():
             return PeerInvalid()
     return None
@@ -170,11 +186,7 @@ class TelethonAccount:
             if not isinstance(message, TlMessage):  # service messages, empty slots
                 continue
             text = message.message or ""
-            reactions = {
-                _emoticon_from_api(count.reaction.emoticon)
-                for count in (message.reactions.results if message.reactions else ())
-                if isinstance(count.reaction, ReactionEmoji) and count.count > 0
-            }
+            reactions = _reactions(message)
             result.append(
                 WorkChatMessage(
                     chat_id=chat_id,
@@ -208,7 +220,8 @@ class TelethonAccount:
                     return _author(await self._client.get_entity(PeerUser(link.user_id)))
                 except ValueError:
                     # Not cached for this account; tg://user?id= names the id directly.
-                    return ResolvedAuthor(link.user_id, None, None)
+                    # Its username is unknown then, which is not the same as none.
+                    return ResolvedAuthor(link.user_id, None, None, username_known=False)
         except errors.RPCError as exc:
             _reraise(exc)
         raise SourceUnavailable("empty link")
@@ -240,6 +253,8 @@ class TelethonAccount:
         except _TIMEOUTS as exc:
             raise SendTimeout() from exc
         except errors.RPCError as exc:
+            if map_error(exc) is None and isinstance(exc, _REFUSALS):
+                raise SendRefused(exc.message) from exc
             _reraise(exc)
         return SentMessage(_sent_id(result))
 
@@ -255,6 +270,18 @@ class TelethonAccount:
             )
         except errors.RPCError as exc:
             _reraise(exc)
+
+    async def fetch_reactions(self, chat_id: int, message_id: int) -> set[str]:
+        chat = await self._input_entity(chat_id)
+        try:
+            message = await self._client.get_messages(chat, ids=message_id)
+        except _SOURCE_ERRORS as exc:
+            raise SourceUnavailable("message") from exc
+        except errors.RPCError as exc:
+            _reraise(exc)
+        if not isinstance(message, TlMessage):
+            raise SourceUnavailable("message deleted")
+        return _reactions(message)
 
     async def check_connection(self) -> AccountHealth:
         try:
@@ -363,6 +390,14 @@ def _links(text: str, entities: Any) -> list[LeadLink]:
         return []
 
 
+def _reactions(message: TlMessage) -> set[str]:
+    return {
+        _emoticon_from_api(count.reaction.emoticon)
+        for count in (message.reactions.results if message.reactions else ())
+        if isinstance(count.reaction, ReactionEmoji) and count.count > 0
+    }
+
+
 def _input_peer_user(entity: Any) -> InputPeerUser | None:
     if (
         isinstance(entity, User)
@@ -384,7 +419,14 @@ def _author(entity: Any) -> ResolvedAuthor:
     if entity.bot:
         raise AuthorUnavailable("bot")
     name = " ".join(p for p in (entity.first_name, entity.last_name) if p) or None
-    return ResolvedAuthor(entity.id, entity.username, name, bool(entity.bot))
+    # A user may have only collectible usernames (`usernames`, `username` empty). A
+    # "min" constructor may leave fields out, so its missing username proves nothing.
+    username = entity.username or next(
+        (u.username for u in entity.usernames or () if u.active), None
+    )
+    return ResolvedAuthor(
+        entity.id, username, name, bool(entity.bot), username_known=not entity.min
+    )
 
 
 def _sent_id(result: Any) -> int | None:
