@@ -4,13 +4,16 @@ Lock order everywhere: conversation -> message -> account. Conversations and
 accounts are taken with SKIP LOCKED, so concurrent dispatchers never wait on
 each other; a skipped row counts as "busy" and is retried by dispatch_batch.
 An account is locked only when something about it can race: its round-robin
-position (last_assigned_at) or its max_active load.
+position (last_assigned_at) or its max_active load. It is locked FOR NO KEY UPDATE:
+rows that merely reference the account (assignments, messages, outbox) hold a FK
+KEY SHARE lock on it, which must not make the operator look busy.
 """
 
 import asyncio
 from typing import NamedTuple
 
 from sqlalchemy import ColumnElement, and_, exists, func, insert, or_, select, update
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
@@ -51,8 +54,8 @@ ELIGIBLE: ColumnElement[bool] = and_(
     or_(Account.max_active.is_(None), _active_count < Account.max_active),
 )
 
-_CANDIDATES = (
-    select(Message.id, Message.conversation_id)
+_PENDING = (
+    select(Message.id, Message.conversation_id, Message.received_at)
     .join(Conversation, Conversation.id == Message.conversation_id)
     .where(
         Message.status == MessageStatus.PENDING.value,
@@ -65,7 +68,14 @@ _CANDIDATES = (
             exists().where(Account.id == Conversation.operator_account_id, ELIGIBLE),
         ),
     )
-    .order_by(Message.received_at, Message.id)
+    # One candidate per conversation, its oldest message: a conversation that is locked
+    # or has a long backlog takes one slot of the window, not all of them.
+    .ext(distinct_on(Message.conversation_id))
+    .order_by(Message.conversation_id, Message.received_at, Message.id)
+    .subquery()
+)
+_CANDIDATES = select(_PENDING.c.id, _PENDING.c.conversation_id).order_by(
+    _PENDING.c.received_at, _PENDING.c.id
 )
 
 _ROUND_ROBIN_ORDER = (
@@ -125,10 +135,7 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
     limit = candidate_limit or get_settings().DISPATCH_CANDIDATE_LIMIT
     candidates = (await session.execute(_CANDIDATES.limit(limit))).all()
     busy = held = operators_busy = False
-    skipped: set[int] = set()
     for message_id, conversation_id in candidates:
-        if conversation_id in skipped:
-            continue
         conversation = (
             await session.execute(
                 select(Conversation.operator_account_id)
@@ -138,7 +145,6 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
         ).one_or_none()
         if conversation is None:
             busy = True
-            skipped.add(conversation_id)
             continue
         status = await session.scalar(
             select(Message.status).where(Message.id == message_id).with_for_update()
@@ -157,12 +163,10 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
             else:
                 # Owner's rule: no automatic reassignment; a human moves the conversation.
                 held |= await _hold_for_pinned_operator(session, conversation_id, pinned)
-            skipped.add(conversation_id)
             continue
 
         if operators_busy:  # all eligible operators were locked a moment ago; next pass
             busy = True
-            skipped.add(conversation_id)
             continue
         account_id, operators_busy = await _lock_round_robin(session)
         if account_id is not None:
@@ -173,7 +177,6 @@ async def _dispatch_pass(session: AsyncSession, candidate_limit: int | None) -> 
         if not operators_busy:
             return _Pass(None, held=held)  # no eligible operator at all; messages stay pending
         busy = True
-        skipped.add(conversation_id)
     return _Pass(None, busy, held)
 
 
@@ -200,7 +203,9 @@ async def _lock_operator(session: AsyncSession, account_id: int) -> bool | None:
     """
     savepoint = await session.begin_nested()
     locked = await session.scalar(
-        select(Account.id).where(Account.id == account_id).with_for_update(skip_locked=True)
+        select(Account.id)
+        .where(Account.id == account_id)
+        .with_for_update(skip_locked=True, key_share=True)  # FOR NO KEY UPDATE
     )
     # A fresh statement sees assignments committed after the locking SELECT's snapshot,
     # so max_active cannot be overshot by a concurrent dispatcher.
@@ -230,7 +235,7 @@ async def _lock_round_robin(session: AsyncSession) -> tuple[int | None, bool]:
         locked = await session.scalar(
             select(Account.id)
             .where(Account.id == account_id, Account.last_assigned_at.is_not_distinct_from(seen))
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True, key_share=True)  # FOR NO KEY UPDATE
         )
         # Fresh statement under the lock: sees assignments committed meanwhile (max_active).
         if locked is not None and await is_eligible(session, account_id):

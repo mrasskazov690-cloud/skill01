@@ -2,16 +2,23 @@ import asyncio
 import io
 import json
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import structlog
-from sqlalchemy import update
+from sqlalchemy import select, text, update
 
 from app.db.models import Account, AuditLog, Message, Outbox
 from app.db.session import transaction
-from app.domain.errors import IdempotencyConflict, NotOwner, SendInFlight, WrongState
+from app.domain.errors import (
+    ConversationBusy,
+    IdempotencyConflict,
+    NotOwner,
+    SendInFlight,
+    WrongState,
+)
 from app.logging import configure_logging
+from app.services.assignments import reassign_conversation
 from app.services.claims import recover_stale
 from app.services.outbox import (
     enqueue_reply,
@@ -24,6 +31,7 @@ from app.telegram.base import (
     FloodWait,
     PeerFlood,
     PeerInvalid,
+    PeerRef,
     PermanentSendError,
     SendTimeout,
     SentMessage,
@@ -65,6 +73,14 @@ async def _send(factory: Factory, outbox_id: int, adapter: FakeTelegramAccount, 
     return await execute_send(factory, outbox_id, adapter, **kw)
 
 
+async def _until(predicate, what: str) -> None:  # type: ignore[no-untyped-def]
+    for _ in range(500):
+        if await predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
 async def test_successful_send(session_factory: Factory, work: tuple[int, int]) -> None:
     message_id, operator_id = work
     queued = await queued_reply(session_factory, message_id, operator_id)
@@ -77,7 +93,7 @@ async def test_successful_send(session_factory: Factory, work: tuple[int, int]) 
 
     assert await _send(session_factory, queued.id, adapter) == "sent"
 
-    assert adapter.sent == [("@client", REPLY_BODY)]
+    assert adapter.sent == [(PeerRef(tg_user_id=1, username="client"), REPLY_BODY)]
     row = await get(session_factory, Outbox, queued.id)
     assert (row.status, row.tg_sent_message_id, row.attempts, row.error) == ("sent", 777, 1, None)
     assert row.sent_at is not None
@@ -453,7 +469,159 @@ async def test_peer_is_the_user_id_without_username(
     adapter = FakeTelegramAccount(operator_id)
 
     await _send(session_factory, outbox_id, adapter)
-    assert adapter.sent == [(4242, REPLY_BODY)]
+    assert adapter.sent == [(PeerRef(tg_user_id=4242), REPLY_BODY)]
+
+
+async def test_reply_peer_has_the_authors_id_and_current_username(
+    session_factory: Factory, main_id: int, make_account
+) -> None:
+    await make_account()
+    message_id, operator_id = await processing_message(
+        session_factory, main_id, client=31, username="old_name"
+    )
+    await new_message(session_factory, main_id, client=31, username="new_name")  # renamed
+    outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+    adapter = FakeTelegramAccount(operator_id)
+
+    assert await _send(session_factory, outbox_id, adapter) == "sent"
+    # Never a bare "@old_name", which may belong to someone else by now.
+    assert adapter.sent == [(PeerRef(tg_user_id=31, username="new_name"), REPLY_BODY)]
+
+
+async def test_cancelled_send_becomes_uncertain_at_once(
+    session_factory: Factory, work: tuple[int, int]
+) -> None:
+    message_id, operator_id = work
+    outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+    adapter = FakeTelegramAccount(operator_id, delay=3600)  # the request hangs
+
+    async def called() -> bool:
+        return bool(adapter.calls)
+
+    sending = asyncio.create_task(_send(session_factory, outbox_id, adapter))
+    await _until(called, "the API call")
+    sending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+
+    row = await get(session_factory, Outbox, outbox_id)
+    assert (row.status, row.error, row.attempts) == ("uncertain", "cancelled_error", 1)
+    message = await get(session_factory, Message, message_id)
+    assert (message.status, message.review_reason) == ("awaiting_review", "send_uncertain")
+    async with transaction(session_factory) as s:
+        assert await recover_interrupted_sends(s) == 0  # nothing left for the next start
+    assert await _send(session_factory, outbox_id, adapter) is None
+    assert len(adapter.calls) == 1
+
+
+async def test_send_result_is_recorded_when_cancelled_meanwhile(
+    session_factory: Factory, work: tuple[int, int]
+) -> None:
+    message_id, operator_id = work
+    outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+    tasks: list[asyncio.Task] = []
+
+    class CancelledOnReturn(FakeTelegramAccount):
+        async def send_text(self, peer, text):  # type: ignore[no-untyped-def]
+            sent = await super().send_text(peer, text)
+            # Lands while the result is being written.
+            asyncio.get_running_loop().call_soon(tasks[0].cancel)
+            return sent
+
+    tasks.append(
+        asyncio.create_task(_send(session_factory, outbox_id, CancelledOnReturn(operator_id)))
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await tasks[0]
+
+    async def recorded() -> bool:
+        return (await get(session_factory, Outbox, outbox_id)).status != "sending"
+
+    await _until(recorded, "the send result")
+    assert (await get(session_factory, Outbox, outbox_id)).status == "sent"
+    assert (await get(session_factory, Message, message_id)).status == "answered"
+
+
+async def test_account_flood_wait_extends_the_lease_of_deferred_replies(
+    session_factory: Factory, main_id: int, make_account
+) -> None:
+    await make_account()
+    first, operator_id = await processing_message(session_factory, main_id, client=1)
+    second, _ = await processing_message(session_factory, main_id, client=2)
+    row_a = (await queued_reply(session_factory, first, operator_id)).id
+    row_b = (await queued_reply(session_factory, second, operator_id)).id
+    adapter = FakeTelegramAccount(operator_id, [FloodWait(3600)])
+    assert await _send(session_factory, row_a, adapter) == "queued"
+
+    assert await _send(session_factory, row_b, adapter) is None  # the account waits
+
+    until = (await get(session_factory, Account, operator_id)).flood_wait_until
+    assert until is not None
+    lease = (await get(session_factory, Message, second)).lease_expires_at
+    assert lease is not None and lease >= until + timedelta(seconds=300)
+    async with transaction(session_factory) as s:  # long after the claim's own lease
+        assert await recover_stale(s, datetime.now(UTC) + timedelta(seconds=1000)) == 0
+    assert (await get(session_factory, Outbox, row_b)).status == "queued"
+    assert (await get(session_factory, Message, second)).status == "processing"
+
+
+async def _lock_waiters(factory: Factory) -> int:
+    async with factory() as s:
+        return (
+            await s.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                    " AND wait_event_type = 'Lock'"
+                )
+            )
+        ) or 0
+
+
+async def test_startup_sweep_and_reassignment_do_not_deadlock(
+    session_factory: Factory, main_id: int, make_account
+) -> None:
+    await make_account()
+    target = (await make_account()).id
+    m1 = await new_message(session_factory, main_id, client=1)
+    m2 = await new_message(session_factory, main_id, client=1)
+    await dispatch_all(session_factory)
+    operator_id = await claim(session_factory, m1)
+    await claim(session_factory, m2)
+    for message_id in (m2, m1):  # outbox ids in the reverse order of message ids
+        outbox_id = (await queued_reply(session_factory, message_id, operator_id)).id
+        with pytest.raises(Crash):
+            await _send(session_factory, outbox_id, FakeTelegramAccount(operator_id, [Crash()]))
+    conversation_id = (await get(session_factory, Message, m1)).conversation_id
+
+    async def reassign() -> None:
+        async with transaction(session_factory) as s:
+            await reassign_conversation(s, conversation_id, target, "admin:olga")
+
+    async def sweep() -> int:
+        async with transaction(session_factory) as s:
+            return await recover_interrupted_sends(s)
+
+    async def waiting(n: int):  # type: ignore[no-untyped-def]
+        async def check() -> bool:
+            return await _lock_waiters(session_factory) >= n
+
+        await _until(check, f"{n} lock waiters")
+
+    # Deterministic interleaving: the reassignment holds the conversation and queues for
+    # m1 first; the sweep starts while it waits.
+    async with transaction(session_factory) as blocker:
+        await blocker.execute(select(Message.id).where(Message.id == m1).with_for_update())
+        reassigning = asyncio.create_task(reassign())
+        await waiting(1)
+        sweeping = asyncio.create_task(sweep())
+        await waiting(2)
+    results = await asyncio.wait_for(
+        asyncio.gather(reassigning, sweeping, return_exceptions=True), timeout=30
+    )
+
+    assert isinstance(results[0], ConversationBusy)  # its messages are in work
+    assert results[1] == 2
+    assert {r.status for r in await rows(session_factory, Outbox)} == {"uncertain"}
 
 
 async def test_expire_flood_waits(session_factory: Factory, make_account) -> None:

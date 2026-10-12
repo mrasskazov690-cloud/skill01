@@ -9,8 +9,19 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from app.domain.states import AccountState
+from app.telegram.links import LeadLink
 
-Peer = int | str  # Telegram user/chat id, or @username
+
+@dataclass(frozen=True, slots=True)
+class PeerRef:
+    """The author a reply is for. Adapters deliver only to `tg_user_id`: through the
+    sender of the lead's original message (`source`, opened by the sending account
+    itself) or through `username` if it resolves to that same id right now. A stored
+    username may have been released and taken by someone else since."""
+
+    tg_user_id: int | None
+    username: str | None = None
+    source: LeadLink | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +44,7 @@ class TelegramAccount(Protocol):
     @property
     def account_id(self) -> int: ...
 
-    async def send_text(self, peer: Peer, text: str) -> SentMessage: ...
+    async def send_text(self, peer: PeerRef, text: str) -> SentMessage: ...
 
     async def check_connection(self) -> AccountHealth: ...
 

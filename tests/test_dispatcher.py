@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from app.db.models import Account, Assignment, AuditLog, Conversation, Message
 from app.db.session import transaction
+from app.services.assignments import assign_manual
 from app.services.dispatcher import PINNED_OPERATOR_UNAVAILABLE, dispatch_batch, dispatch_one
 from tests.helpers import (
     CLIENT_TEXT,
@@ -196,6 +197,39 @@ async def test_locked_conversation_is_skipped_not_waited_for(
         assert await dispatch_batch(session_factory, 10, max_busy_retries=2) == []
 
     assert await dispatch_all(session_factory) == [locked_msg]
+
+
+async def test_locked_conversation_with_a_backlog_does_not_fill_the_window(
+    session_factory: Factory, main_id: int, operators: list[int]
+) -> None:
+    backlog = [await new_message(session_factory, main_id, client=1) for _ in range(3)]
+    other = await new_message(session_factory, main_id, client=2)
+    locked_conv = (await get(session_factory, Message, backlog[0])).conversation_id
+
+    async with transaction(session_factory) as holder:
+        await holder.execute(
+            select(Conversation.id).where(Conversation.id == locked_conv).with_for_update()
+        )
+        async with transaction(session_factory) as s:
+            assert await dispatch_one(s, candidate_limit=2) == other
+
+    assert sorted(await dispatch_all(session_factory)) == backlog
+
+
+async def test_operator_referenced_by_another_transaction_keeps_its_turn(
+    session_factory: Factory, main_id: int, operators: list[int]
+) -> None:
+    first = operators[0]
+    manual = await new_message(session_factory, main_id, client=1)
+    auto = await new_message(session_factory, main_id, client=2)
+
+    async with transaction(session_factory) as admin:
+        # A manual assignment in progress holds FK KEY SHARE locks on `first`.
+        await assign_manual(admin, manual, first, "admin:olga")
+        async with transaction(session_factory) as s:
+            assert await dispatch_one(s) == auto
+
+    assert await _operator_of(session_factory, auto) == first  # its round-robin turn
 
 
 async def test_locked_operator_is_skipped(

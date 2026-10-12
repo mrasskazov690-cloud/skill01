@@ -9,8 +9,8 @@ from sqlalchemy.types import DateTime
 
 from app.config import get_settings
 from app.db.models import Message, Outbox
-from app.domain.errors import NotFound, NotOwner, SendInFlight, WrongState
-from app.domain.states import LIVE_SEND_STATUSES, MessageStatus, SendStatus
+from app.domain.errors import NotFound, NotOwner, SendInFlight
+from app.domain.states import LIVE_SEND_STATUSES, InvalidTransition, MessageStatus, SendStatus
 from app.services.transitions import change_message_status, change_send_status
 
 SEND_IN_FLIGHT_ON_RECOVERY = "send_in_flight_on_recovery"
@@ -65,8 +65,8 @@ async def release(session: AsyncSession, message_id: int, worker: str) -> None:
     ).one_or_none()
     if message is None:
         raise NotFound(f"message {message_id}")
-    if message.status != MessageStatus.PROCESSING:
-        raise WrongState(f"message {message_id} is {message.status}, not processing")
+    if message.status != MessageStatus.PROCESSING:  # release is processing -> assigned only
+        raise InvalidTransition(message.status, MessageStatus.ASSIGNED)
     if message.claimed_by != worker:
         raise NotOwner(f"message {message_id} is claimed by another worker")
     if await _live_sends(session, message_id):

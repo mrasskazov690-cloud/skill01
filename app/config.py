@@ -15,6 +15,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_ignore_empty=True,  # `KEY=` lines from .env.example fall back to defaults
         extra="ignore",
+        # A failed field must not echo its input: for a missing one that is the whole
+        # dict of values read from the environment and .env, secrets included.
+        hide_input_in_errors=True,
     )
 
     # SecretStr keeps the URL (with its password) out of repr/str/model_dump_json.

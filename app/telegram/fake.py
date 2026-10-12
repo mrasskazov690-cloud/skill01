@@ -5,7 +5,7 @@ from collections import deque
 from collections.abc import Iterable
 
 from app.domain.states import AccountState
-from app.telegram.base import AccountHealth, Peer, SentMessage
+from app.telegram.base import AccountHealth, PeerRef, SentMessage
 
 # A scripted outcome for one send_text call: a SentMessage to return, an exception
 # (instance or class) to raise, or None for an automatic success.
@@ -25,8 +25,8 @@ class FakeTelegramAccount:
         self._outcomes: deque[Outcome] = deque(outcomes)
         self.health = health or AccountHealth(AccountState.ACTIVE)
         self.delay = delay
-        self.calls: list[tuple[Peer, str]] = []  # every send_text attempt
-        self.sent: list[tuple[Peer, str]] = []  # attempts that returned success
+        self.calls: list[tuple[PeerRef, str]] = []  # every send_text attempt
+        self.sent: list[tuple[PeerRef, str]] = []  # attempts that returned success
         self._next_message_id = 1
 
     @property
@@ -41,7 +41,7 @@ class FakeTelegramAccount:
         """Queue outcomes for the next send_text calls; when empty, sends succeed."""
         self._outcomes.extend(outcomes)
 
-    async def send_text(self, peer: Peer, text: str) -> SentMessage:
+    async def send_text(self, peer: PeerRef, text: str) -> SentMessage:
         self.calls.append((peer, text))
         if self.delay:
             await asyncio.sleep(self.delay)

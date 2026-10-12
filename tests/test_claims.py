@@ -4,7 +4,7 @@ import pytest
 
 from app.db.models import AuditLog, Message, Outbox
 from app.db.session import transaction
-from app.domain.errors import NotFound, NotOwner, SendInFlight, WrongState
+from app.domain.errors import NotFound, NotOwner, SendInFlight
 from app.domain.states import InvalidTransition
 from app.services.claims import (
     SEND_IN_FLIGHT_ON_RECOVERY,
@@ -84,7 +84,7 @@ async def test_release_returns_to_assigned(
     session_factory: Factory, assigned: tuple[int, int]
 ) -> None:
     message_id, _ = assigned
-    with pytest.raises(WrongState):
+    with pytest.raises(InvalidTransition):  # not claimed: release is processing -> assigned
         async with transaction(session_factory) as s:
             await release(s, message_id, "w1")
     await claim(session_factory, message_id, worker="w1")

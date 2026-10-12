@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from typing import Any, TextIO
 
 import structlog
+from structlog.processors import ExceptionRenderer
+from structlog.tracebacks import ExceptionDictTransformer
 from structlog.typing import EventDict, WrappedLogger
 
 # A key is sensitive if it equals one of these words or contains one as a
@@ -32,6 +34,11 @@ def redact(value: Any) -> Any:
     return value
 
 
+# Tracebacks are rendered after redaction, so frame locals (client text, passwords)
+# must never be part of them.
+_dict_tracebacks = ExceptionRenderer(ExceptionDictTransformer(show_locals=False))
+
+
 def redact_processor(_: WrappedLogger, __: str, event_dict: EventDict) -> EventDict:
     return {k: redact(v) for k, v in event_dict.items() if not is_sensitive_key(k)}
 
@@ -43,7 +50,7 @@ def configure_logging(level: str = "INFO", stream: TextIO | None = None) -> None
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             redact_processor,
-            structlog.processors.dict_tracebacks,
+            _dict_tracebacks,
             structlog.processors.JSONRenderer(ensure_ascii=False),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(

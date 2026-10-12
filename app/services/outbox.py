@@ -4,6 +4,7 @@ Outbox rows only change while their message row is locked (lock order: conversat
 -> message -> outbox -> account), so a message and its live send never disagree.
 """
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -34,6 +35,7 @@ from app.services.transitions import (
 from app.telegram.base import (
     FloodWait,
     PeerFlood,
+    PeerRef,
     PermanentSendError,
     SentMessage,
     TelegramAccount,
@@ -47,6 +49,9 @@ FLOOD_WAIT_LIMIT = "flood_wait_limit"
 _PAUSED_STATES = frozenset(
     {AccountState.RESTRICTED, AccountState.PAUSED, AccountState.DISCONNECTED}
 )
+# Strong references to send-result recordings: the event loop keeps only weak ones, and
+# a recording outlives an execute_send that is cancelled while waiting for it.
+_recordings: set[asyncio.Task[SendStatus]] = set()
 
 
 def default_idempotency_key(message_id: int) -> str:
@@ -135,7 +140,7 @@ class _SendJob:
     message_id: int
     account_id: int
     attempt: int
-    peer: int | str
+    peer: PeerRef
     body: str
 
 
@@ -152,6 +157,7 @@ async def execute_send(
     Returns the row's new status, or None if nothing was attempted: the row is not
     queued, is not due yet (`not_before`, account flood wait) or its account is paused.
     `now` overrides the database clock for due checks (tests, replays).
+    Cancelled during the API call, it records the row as 'uncertain' and re-raises.
     """
     async with transaction(session_factory) as session:
         job = await _begin_send(session, outbox_id, adapter.account_id, now)
@@ -159,15 +165,39 @@ async def execute_send(
         return job
     # 'sending' is committed and no transaction is open during the call: if the process
     # dies now, the startup sweep finds the row in 'sending' and never re-sends it blindly.
-    outcome: SentMessage | Exception
+    outcome: SentMessage | BaseException
     try:
         outcome = await adapter.send_text(job.peer, job.body)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         outcome = exc
-    async with transaction(session_factory) as session:
-        return await _finish_send(
-            session, job, outcome, now, max_attempts or get_settings().DISPATCH_MAX_SEND_ATTEMPTS
+    # The result is written in its own task, so cancelling this one (again) cannot
+    # interrupt it: a cancelled call becomes 'uncertain' now, not at the next start.
+    recording = asyncio.create_task(
+        _record_result(
+            session_factory,
+            job,
+            outcome,
+            now,
+            max_attempts or get_settings().DISPATCH_MAX_SEND_ATTEMPTS,
         )
+    )
+    _recordings.add(recording)
+    recording.add_done_callback(_recordings.discard)
+    status = await asyncio.shield(recording)
+    if isinstance(outcome, asyncio.CancelledError):
+        raise outcome
+    return status
+
+
+async def _record_result(
+    session_factory: async_sessionmaker[AsyncSession],
+    job: _SendJob,
+    outcome: SentMessage | BaseException,
+    now: datetime | None,
+    max_attempts: int,
+) -> SendStatus:
+    async with transaction(session_factory) as session:
+        return await _finish_send(session, job, outcome, now, max_attempts)
 
 
 async def _begin_send(
@@ -208,6 +238,7 @@ async def _begin_send(
             .values(not_before=account.flood_wait_until)
             .execution_options(synchronize_session=False)
         )
+        await _extend_lease(session, message_id, account.flood_wait_until)
         return None
     if message.status != MessageStatus.PROCESSING or message.operator_account_id != account_id:
         await change_send_status(
@@ -245,7 +276,7 @@ async def _begin_send(
 async def _finish_send(
     session: AsyncSession,
     job: _SendJob,
-    outcome: SentMessage | Exception,
+    outcome: SentMessage | BaseException,
     now: datetime | None,
     max_attempts: int,
 ) -> SendStatus:
@@ -308,15 +339,7 @@ async def _finish_send(
         case FloodWait() if job.attempt < max_attempts:
             not_before = now + timedelta(seconds=max(outcome.seconds, 0))
             await to_outbox(SendStatus.QUEUED, not_before=not_before)
-            # Keep the claim alive until the retry is due, so recover_stale does not
-            # cancel a reply that is only waiting out the flood limit.
-            lease_end = not_before + timedelta(seconds=get_settings().DISPATCH_LEASE_SECONDS)
-            await session.execute(
-                update(Message)
-                .where(Message.id == job.message_id, Message.status == MessageStatus.PROCESSING)
-                .values(lease_expires_at=func.greatest(Message.lease_expires_at, lease_end))
-                .execution_options(synchronize_session=False)
-            )
+            await _extend_lease(session, job.message_id, not_before)
             return SendStatus.QUEUED
         case FloodWait():
             await to_outbox(SendStatus.FAILED)
@@ -332,8 +355,8 @@ async def _finish_send(
             await to_message(MessageStatus.FAILED, code)
             return SendStatus.FAILED
         case _:
-            # SendTimeout or anything unexpected: delivery is unknown. Never retried
-            # automatically; a human checks the chat and calls resolve_uncertain().
+            # SendTimeout, a cancelled call or anything unexpected: delivery is unknown.
+            # Never retried automatically; a human checks the chat (resolve_uncertain()).
             await to_outbox(SendStatus.UNCERTAIN)
             await to_message(MessageStatus.AWAITING_REVIEW, SEND_UNCERTAIN)
             return SendStatus.UNCERTAIN
@@ -399,13 +422,19 @@ async def recover_interrupted_sends(session: AsyncSession) -> int:
     for manual review. Run before any send worker starts."""
     rows = (
         await session.execute(
-            select(Outbox.id, Outbox.message_id)
+            select(Outbox.id, Outbox.message_id, Message.conversation_id)
+            .join(Message, Message.id == Outbox.message_id)
             .where(Outbox.status == SendStatus.SENDING.value)
-            .order_by(Outbox.id)
+            .order_by(Message.conversation_id, Outbox.message_id)
         )
     ).all()
     recovered = 0
-    for outbox_id, message_id in rows:
+    for outbox_id, message_id, conversation_id in rows:
+        # Lock order conversation -> message -> outbox, as in reassignment, which locks
+        # a conversation's messages in id order: otherwise the two can deadlock.
+        await session.execute(
+            select(Conversation.id).where(Conversation.id == conversation_id).with_for_update()
+        )
         message = await _lock_message(session, message_id)
         status = await _lock_outbox_status(session, outbox_id)
         if status != SendStatus.SENDING:
@@ -505,8 +534,20 @@ async def _mark_sent(
     )
 
 
+async def _extend_lease(session: AsyncSession, message_id: int, retry_at: datetime) -> None:
+    """Keep the claim alive until a deferred send is due, so recover_stale does not
+    cancel a reply that is only waiting out a flood limit."""
+    lease_end = retry_at + timedelta(seconds=get_settings().DISPATCH_LEASE_SECONDS)
+    await session.execute(
+        update(Message)
+        .where(Message.id == message_id, Message.status == MessageStatus.PROCESSING)
+        .values(lease_expires_at=func.greatest(Message.lease_expires_at, lease_end))
+        .execution_options(synchronize_session=False)
+    )
+
+
 async def _apply_account_effect(
-    session: AsyncSession, account_id: int, outcome: SentMessage | Exception, now: datetime
+    session: AsyncSession, account_id: int, outcome: SentMessage | BaseException, now: datetime
 ) -> None:
     """Account state follows what the API said, whatever happened to the row meanwhile."""
     if isinstance(outcome, FloodWait):
@@ -597,7 +638,7 @@ async def _lock_outbox_status(session: AsyncSession, outbox_id: int) -> SendStat
     return SendStatus(status.scalar_one())
 
 
-async def _peer(session: AsyncSession, conversation_id: int) -> int | str:
+async def _peer(session: AsyncSession, conversation_id: int) -> PeerRef:
     client = (
         await session.execute(
             select(Client.tg_user_id, Client.username)
@@ -605,11 +646,9 @@ async def _peer(session: AsyncSession, conversation_id: int) -> int | str:
             .where(Conversation.id == conversation_id)
         )
     ).one()
-    # Operators are not the account the client wrote to, and a bare user id is often
-    # unresolvable for them; a username always resolves.
-    if client.username:
-        return f"@{client.username}"
-    return int(client.tg_user_id)  # ck_clients_has_identity: one of the two is set
+    # Never a bare username: it may belong to someone else by now. The adapter checks
+    # that whatever it resolves is this tg_user_id.
+    return PeerRef(tg_user_id=client.tg_user_id, username=client.username)
 
 
 async def _db_now(session: AsyncSession) -> datetime:

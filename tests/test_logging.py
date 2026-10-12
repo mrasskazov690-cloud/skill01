@@ -55,6 +55,25 @@ def test_sensitive_keys_are_removed_at_any_depth(log_output: io.StringIO) -> Non
     assert record["details"] == {"status": "pending", "items": [{"id": 7}]}
 
 
+def test_exception_tracebacks_do_not_render_local_variables(log_output: io.StringIO) -> None:
+    def handle(text: str) -> None:
+        password = "pw-local-1"  # noqa: F841
+        raise ValueError("cannot handle the message")
+
+    try:
+        handle(CLIENT_TEXT)
+    except ValueError:
+        get_logger("test").exception("handling_failed", message_id=5)
+
+    output = log_output.getvalue()
+    assert CLIENT_TEXT not in output
+    assert "pw-local-1" not in output
+    [record] = _records(log_output)
+    [exc] = record["exception"]
+    assert exc["exc_type"] == "ValueError"
+    assert [f["name"] for f in exc["frames"]][-1] == "handle"  # the traceback is kept
+
+
 def test_level_filtering(log_output: io.StringIO) -> None:
     log = get_logger()
     log.debug("hidden")

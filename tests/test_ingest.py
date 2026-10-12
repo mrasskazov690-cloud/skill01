@@ -160,8 +160,55 @@ async def test_same_tg_user_id_is_same_client_even_if_username_changed(
     )
     await _ingest(session_factory, main_account_id, client=ClientRef(tg_user_id=7), tg_message_id=3)
 
-    assert await _clients(session_factory) == [(7, "old")]
+    # The current username replaces the stored one; a message without one keeps it.
+    assert await _clients(session_factory) == [(7, "new")]
     assert await _count(session_factory, Conversation) == 1
+
+
+async def test_released_username_moves_to_its_new_owner(
+    session_factory: Factory, main_account_id: int
+) -> None:
+    await _ingest(
+        session_factory,
+        main_account_id,
+        client=ClientRef(tg_user_id=55, username="dave"),
+        tg_message_id=1,
+    )
+    # Telegram user 55 gave up "dave" and user 77 took it.
+    for message_id in (2, 3):
+        await _ingest(
+            session_factory,
+            main_account_id,
+            client=ClientRef(tg_user_id=77, username="@Dave"),
+            tg_message_id=message_id,
+        )
+
+    assert await _clients(session_factory) == [(55, None), (77, "dave")]
+    assert await _count(session_factory, Conversation) == 2
+
+
+async def test_username_only_holder_keeps_its_username(
+    session_factory: Factory, main_account_id: int
+) -> None:
+    await _ingest(
+        session_factory, main_account_id, client=ClientRef(username="erin"), tg_message_id=1
+    )
+    await _ingest(
+        session_factory,
+        main_account_id,
+        client=ClientRef(tg_user_id=66, username="frank"),
+        tg_message_id=2,
+    )
+    await _ingest(
+        session_factory,
+        main_account_id,
+        client=ClientRef(tg_user_id=66, username="erin"),
+        tg_message_id=3,
+    )
+
+    # It may be the same person; not merged here, and nothing is taken from it.
+    assert await _clients(session_factory) == [(None, "erin"), (66, "frank")]
+    assert await _count(session_factory, Message) == 3
 
 
 async def test_username_only_client_gets_tg_user_id_attached(

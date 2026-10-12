@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -132,18 +132,23 @@ async def _lock_conversation(
 
 async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
     """Find or create the client. tg_user_id wins over username; a client first seen
-    by username only gets its tg_user_id attached when it later shows up with both."""
+    by username only gets its tg_user_id attached when it later shows up with both.
+    A client found by tg_user_id gets the username it shows up with now."""
     username = ref.normalized_username
     if ref.tg_user_id is None and username is None:
         raise ValueError("client needs tg_user_id or username")
 
     for _ in range(_MAX_ATTEMPTS):
         if ref.tg_user_id is not None:
-            found = await session.scalar(
-                select(Client.id).where(Client.tg_user_id == ref.tg_user_id)
-            )
+            found = (
+                await session.execute(
+                    select(Client.id, Client.username).where(Client.tg_user_id == ref.tg_user_id)
+                )
+            ).one_or_none()
             if found is not None:
-                return found
+                if username is not None and found.username != username:
+                    await _refresh_username(session, found.id, username)
+                return found.id
 
         insert_username = username
         if username is not None:
@@ -173,6 +178,37 @@ async def _resolve_client(session: AsyncSession, ref: ClientRef) -> int:
         if created is not None:
             return created
     raise IngestConflict("client upsert did not converge")
+
+
+async def _refresh_username(session: AsyncSession, client_id: int, username: str) -> None:
+    """Store the username a client (matched by tg_user_id) has now. Another client with
+    a tg_user_id that still holds it has a stale copy (Telegram released the name), so
+    that copy is cleared. A username-only holder may be this same person and is left
+    alone; the stored name then stays as it was, as it does if the name is taken
+    concurrently. Outbox never relies on the stored name alone (see PeerRef)."""
+    try:
+        async with session.begin_nested():
+            # Both rows locked in id order, so crossing refreshes cannot deadlock.
+            rows = (
+                await session.execute(
+                    select(Client.id, Client.tg_user_id)
+                    .where(or_(Client.id == client_id, Client.username == username))
+                    .order_by(Client.id)
+                    .with_for_update()
+                )
+            ).all()
+            holder = next((r for r in rows if r.id != client_id), None)
+            if holder is not None:
+                if holder.tg_user_id is None:
+                    return
+                await session.execute(
+                    update(Client).where(Client.id == holder.id).values(username=None)
+                )
+            await session.execute(
+                update(Client).where(Client.id == client_id).values(username=username)
+            )
+    except IntegrityError:  # the name was taken concurrently; keep the stored one
+        return
 
 
 async def _attach_tg_user_id(session: AsyncSession, client_id: int, tg_user_id: int) -> bool:

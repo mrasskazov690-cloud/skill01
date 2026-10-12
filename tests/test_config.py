@@ -1,6 +1,8 @@
+from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 from app.db.session import async_url
@@ -44,6 +46,26 @@ def test_settings_require_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
     with pytest.raises(ValueError):
         _settings()
+
+
+def test_validation_error_does_not_echo_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"TEST_DATABASE_URL=postgresql://dispatcher:{PASSWORD}@db.example/test\n"
+        "TG_API_HASH=hash-value-1\n"
+        "DISPATCH_MAX_SEND_ATTEMPTS=-7\n"
+    )
+
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=env_file)  # type: ignore[call-arg]
+
+    rendered = f"{exc.value}\n{exc.value!r}"
+    for leaked in (PASSWORD, "hash-value-1", "-7"):
+        assert leaked not in rendered
+    assert "DATABASE_URL" in rendered and "DISPATCH_MAX_SEND_ATTEMPTS" in rendered
 
 
 def test_non_postgres_url_rejected() -> None:
